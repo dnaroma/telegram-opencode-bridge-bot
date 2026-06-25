@@ -701,19 +701,20 @@ async def _listen_and_stream_events(
                                             desc = input_data.get("description", "") if isinstance(input_data, dict) else ""
                                             desc_text = f" — <i>\"{html.escape(desc)}\"</i>" if desc else ""
                                             
-                                            # Format arguments
-                                            arg_lines = []
-                                            if isinstance(input_data, dict):
-                                                for k, v in input_data.items():
-                                                    if k not in ("description", "content"):
-                                                        arg_lines.append(f"<b>{html.escape(str(k))}:</b> {html.escape(truncate(str(v)))}")
-                                            args_text = "\n".join(arg_lines)
+                                            msg = f"🛠️ <b>Calling Tool <code>{html.escape(tool_name)}</code></b>{desc_text}\n"
                                             
-                                            msg = (
-                                                f"🛠️ <b>Calling Tool <code>{html.escape(tool_name)}</code></b>{desc_text}\n"
-                                            )
-                                            if args_text:
-                                                msg += f"{args_text}\n"
+                                            if isinstance(input_data, dict):
+                                                params = {k: v for k, v in input_data.items() if k != "description"}
+                                                
+                                                if params:
+                                                    msg += "\n<b>Parameters:</b>\n"
+                                                    for k, v in params.items():
+                                                        v_str = str(v)
+                                                        if len(v_str) > 100:
+                                                            v_display = f"{v_str[:100]}... ({len(v_str)} chars)"
+                                                        else:
+                                                            v_display = v_str
+                                                        msg += f"  • <code>{html.escape(k)}</code>: {html.escape(v_display)}\n"
                                                 
                                             await update.message.reply_text(msg, parse_mode="HTML")
 
