@@ -1860,8 +1860,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     variant_id = str(variant)
                     variant_name = str(variant)
                 
-                # Store full model path with variant: model_id already contains provider
-                variant_path = f"{model_id}/{variant_id}"
+                # Include provider in the path: provider/model/variant
+                variant_path = f"{provider_id}/{model_id}/{variant_id}"
                 
                 variants_keyboard.append([InlineKeyboardButton(
                     f"✨ {variant_name}",

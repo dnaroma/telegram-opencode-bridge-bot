@@ -1791,6 +1791,46 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     parse_mode="HTML"
                 )
 
+    # 1.6 Handle Question Responses
+    elif data.startswith("question:"):
+        parts = data.split(":", 2)
+        if len(parts) >= 3:
+            short_key = parts[1]
+            answer = parts[2]
+            
+            pending_questions = bot_data.get("pending_questions", {})
+            pending = pending_questions.get(short_key)
+            
+            if not pending:
+                await query.edit_message_text(
+                    text=f"{query.message.text}\n\n⚠️ <b>Question Expired:</b> This question is no longer valid or the bot was restarted.",
+                    parse_mode="HTML"
+                )
+                return
+                
+            session_id = pending["session_id"]
+            question_id = pending["question_id"]
+            
+            try:
+                success = await oc_client.respond_to_question(
+                    session_id=session_id,
+                    question_id=question_id,
+                    answer=answer
+                )
+                
+                pending_questions.pop(short_key, None)
+                
+                await query.edit_message_text(
+                    text=f"{query.message.text}\n\n✅ <b>Answer Submitted:</b> <code>{html.escape(answer)}</code>",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Error responding to question {question_id} in callback: {e}", exc_info=True)
+                await query.edit_message_text(
+                    text=f"{query.message.text}\n\n⚠️ <b>Error:</b> Failed to submit answer to OpenCode server: {e}",
+                    parse_mode="HTML"
+                )
+
     # 2. Switch Model tap
     elif data.startswith("model:"):
         new_model = data[len("model:"):]
