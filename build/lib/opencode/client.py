@@ -337,12 +337,19 @@ class OpenCodeClient:
             payload["agent"] = agent.strip()
 
         if model:
-            if "/" in model:
-                provider_id, model_id = model.split("/", 1)
+            # Support format: provider/model or provider/model/variant
+            parts = model.split("/")
+            if len(parts) >= 2:
+                provider_id = parts[0]
+                model_id = parts[1]
+                variant_id = parts[2] if len(parts) >= 3 else None
+                
                 payload["model"] = {
                     "providerID": provider_id.strip(),
                     "modelID": model_id.strip(),
                 }
+                if variant_id:
+                    payload["model"]["variant"] = variant_id.strip()
             else:
                 payload["model"] = {
                     "modelID": model.strip(),

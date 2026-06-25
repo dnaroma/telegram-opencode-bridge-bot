@@ -1860,7 +1860,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     variant_id = str(variant)
                     variant_name = str(variant)
                 
-                variant_path = f"{provider_id}/{model_id}/{variant_id}"
+                # Store full model path with variant: model_id already contains provider
+                variant_path = f"{model_id}/{variant_id}"
                 
                 variants_keyboard.append([InlineKeyboardButton(
                     f"✨ {variant_name}",
@@ -1881,17 +1882,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # 2.2.6 Model Variant Selected
     elif data.startswith("modelvariant:"):
         variant_path = data[len("modelvariant:"):]
-        parts = variant_path.split("/")
         
-        if len(parts) == 3:
-            provider_id, model_id, variant_id = parts
-            full_model_path = f"{provider_id}/{model_id}/{variant_id}"
-        else:
-            full_model_path = variant_path
-        
-        await session_mgr.set_model(user_id, full_model_path)
+        # variant_path format: model_id/variant_id (e.g., "google/gemini-2.5-pro/high")
+        await session_mgr.set_model(user_id, variant_path)
         await query.edit_message_text(
-            f"✅ Model variant changed to <code>{html.escape(full_model_path)}</code>\n\n"
+            f"✅ Model variant changed to <code>{html.escape(variant_path)}</code>\n\n"
             f"<i>This applies to your current session.</i>",
             parse_mode="HTML",
         )
