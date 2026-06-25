@@ -1830,7 +1830,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 await query.edit_message_text("❌ Model not found.")
                 return
             
-            variants = target_model.get("variants", [])
+            variants_raw = target_model.get("variants", {})
+            
+            if isinstance(variants_raw, dict):
+                variants = [{"id": k, "name": v.get("name", k) if isinstance(v, dict) else k} 
+                           for k, v in variants_raw.items()]
+            elif isinstance(variants_raw, list):
+                variants = variants_raw
+            else:
+                variants = []
+            
             if not variants:
                 await query.edit_message_text("❌ No variants available for this model.")
                 return
@@ -1844,8 +1853,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )])
             
             for variant in variants:
-                variant_id = variant.get("id", "")
-                variant_name = variant.get("name", variant_id)
+                if isinstance(variant, dict):
+                    variant_id = variant.get("id", "")
+                    variant_name = variant.get("name", variant_id)
+                else:
+                    variant_id = str(variant)
+                    variant_name = str(variant)
+                
                 variant_path = f"{provider_id}/{model_id}/{variant_id}"
                 
                 variants_keyboard.append([InlineKeyboardButton(
