@@ -1801,6 +1801,87 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             parse_mode="HTML",
         )
 
+    # 2.2.5 Model Variants Selection
+    elif data.startswith("modelvariants:"):
+        model_path = data[len("modelvariants:"):]
+        
+        try:
+            parts = model_path.split("/", 1)
+            if len(parts) != 2:
+                await query.edit_message_text("❌ Invalid model path format.")
+                return
+                
+            provider_id, model_id = parts
+            
+            models_data = await oc_client.get_available_models()
+            all_providers = models_data.get("all", [])
+            
+            target_provider = None
+            target_model = None
+            
+            for p in all_providers:
+                if p.get("id", "").lower() == provider_id.lower():
+                    target_provider = p
+                    models = p.get("models", {})
+                    target_model = models.get(model_id)
+                    break
+            
+            if not target_model:
+                await query.edit_message_text("❌ Model not found.")
+                return
+            
+            variants = target_model.get("variants", [])
+            if not variants:
+                await query.edit_message_text("❌ No variants available for this model.")
+                return
+            
+            model_name = target_model.get("name", model_id)
+            
+            variants_keyboard = []
+            variants_keyboard.append([InlineKeyboardButton(
+                f"───【 🎛️ {model_name.upper()} VARIANTS 】───", 
+                callback_data="noop"
+            )])
+            
+            for variant in variants:
+                variant_id = variant.get("id", "")
+                variant_name = variant.get("name", variant_id)
+                variant_path = f"{provider_id}/{model_id}/{variant_id}"
+                
+                variants_keyboard.append([InlineKeyboardButton(
+                    f"✨ {variant_name}",
+                    callback_data=f"modelvariant:{variant_path}"
+                )])
+            
+            variants_keyboard.append([InlineKeyboardButton(
+                f"« ⬅️ Back to {provider_id.capitalize()} Models", 
+                callback_data=f"prov:{provider_id}"
+            )])
+            
+            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(variants_keyboard))
+            
+        except Exception as e:
+            logger.error(f"Failed to show variants for {model_path}: {e}", exc_info=True)
+            await query.edit_message_text(f"❌ Failed to load variants: {e}")
+
+    # 2.2.6 Model Variant Selected
+    elif data.startswith("modelvariant:"):
+        variant_path = data[len("modelvariant:"):]
+        parts = variant_path.split("/")
+        
+        if len(parts) == 3:
+            provider_id, model_id, variant_id = parts
+            full_model_path = f"{provider_id}/{model_id}/{variant_id}"
+        else:
+            full_model_path = variant_path
+        
+        await session_mgr.set_model(user_id, full_model_path)
+        await query.edit_message_text(
+            f"✅ Model variant changed to <code>{html.escape(full_model_path)}</code>\n\n"
+            f"<i>This applies to your current session.</i>",
+            parse_mode="HTML",
+        )
+
     # 2.3 Switch Mode/Agent tap
     elif data.startswith("mode:"):
         new_mode = data[len("mode:"):]
@@ -1859,10 +1940,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             model_buttons = []
             for m_id, m in models.items():
                 m_name = m.get("name", m_id)
+                variants = m.get("variants", [])
                 path = f"{p_id}/{m_id}"
-                
                 display_name = m_name[:15] + "..." if len(m_name) > 18 else m_name
-                model_buttons.append(InlineKeyboardButton(f"🤖 {display_name}", callback_data=f"model:{path}"))
+                
+                has_variants = bool(variants)
+                callback_prefix = "modelvariants:" if has_variants else "model:"
+                arrow_indicator = " ▶" if has_variants else ""
+                
+                button = InlineKeyboardButton(
+                    f"🤖 {display_name}{arrow_indicator}", 
+                    callback_data=f"{callback_prefix}{path}"
+                )
+                model_buttons.append(button)
             
             for j in range(0, len(model_buttons), 2):
                 sub_keyboard.append(model_buttons[j:j+2])
