@@ -704,11 +704,13 @@ async def _listen_and_stream_events(
                                     "question_id": question_id
                                 }
 
-                                msg = f"❓ <b>Question from OpenCode</b>\n\n{html.escape(question_text)}"
+                                msg = f"❓ <b>Question from OpenCode</b>\n\n{html.escape(question_text[:500])}"
 
                                 keyboard = []
+                                MAX_OPTIONS = 10
                                 if options:
-                                    for idx, option in enumerate(options):
+                                    limited_options = options[:MAX_OPTIONS]
+                                    for idx, option in enumerate(limited_options):
                                         if isinstance(option, dict):
                                             label = option.get("label", f"Option {idx+1}")
                                             value = option.get("value", label)
@@ -716,22 +718,34 @@ async def _listen_and_stream_events(
                                             label = str(option)
                                             value = label
                                         
+                                        label_short = label[:50]
                                         keyboard.append([InlineKeyboardButton(
-                                            label,
+                                            label_short,
                                             callback_data=f"question:{short_key}:{value[:40]}"
                                         )])
+                                    
+                                    if len(options) > MAX_OPTIONS:
+                                        msg += f"\n\n<i>(Showing {MAX_OPTIONS} of {len(options)} options)</i>"
                                 
                                 if custom_allowed:
                                     msg += "\n\n<i>Or reply with your own answer in text.</i>"
                                 
-                                if keyboard:
+                                try:
+                                    if keyboard:
+                                        await update.message.reply_text(
+                                            msg,
+                                            parse_mode="HTML",
+                                            reply_markup=InlineKeyboardMarkup(keyboard)
+                                        )
+                                    else:
+                                        await update.message.reply_text(msg, parse_mode="HTML")
+                                        context.user_data["awaiting_question_answer"] = short_key
+                                except Exception as e:
+                                    logger.error(f"Failed to send question prompt: {e}")
                                     await update.message.reply_text(
-                                        msg,
-                                        parse_mode="HTML",
-                                        reply_markup=InlineKeyboardMarkup(keyboard)
+                                        f"❓ Question: {html.escape(question_text[:200])}\n\n<i>Please reply with your answer.</i>",
+                                        parse_mode="HTML"
                                     )
-                                else:
-                                    await update.message.reply_text(msg, parse_mode="HTML")
                                     context.user_data["awaiting_question_answer"] = short_key
 
                             # B. Handle Tool Execution Progress

@@ -538,6 +538,43 @@ class OpenCodeClient:
             )
             raise
 
+    async def respond_to_question(
+        self,
+        session_id: str,
+        question_id: str,
+        answer: str,
+    ) -> bool:
+        """Respond to a question asked by the agent in a session.
+
+        Parameters:
+            session_id: The session identifier.
+            question_id: The question identifier.
+            answer: The user's answer to the question.
+
+        Returns:
+            True if the server successfully recorded the response, False otherwise.
+        """
+        payload = {
+            "answer": answer,
+        }
+        logger.info(
+            f"Sending question response: session={session_id[:8]}... question={question_id}"
+        )
+        try:
+            result = await self._request(
+                "POST",
+                f"/session/{session_id}/questions/{question_id}",
+                json_data=payload,
+            )
+            if isinstance(result, dict):
+                return result.get("success", True)
+            return True
+        except Exception as e:
+            logger.error(
+                f"Failed to respond to question {question_id} in session {session_id}: {e}"
+            )
+            raise
+
     async def delete_session(self, session_id: str) -> bool:
         """Permanently delete a session and all its context on the OpenCode server."""
         try:

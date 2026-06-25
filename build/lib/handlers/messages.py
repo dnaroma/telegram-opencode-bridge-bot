@@ -110,6 +110,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await handle_mcp_input(update, context, mcp_state)
         return
 
+    # ── Check if user is answering a question ───────
+    awaiting_question = context.user_data.get("awaiting_question_answer")
+    if awaiting_question:
+        short_key = awaiting_question
+        pending_questions = context.bot_data.get("pending_questions", {})
+        pending = pending_questions.get(short_key)
+        
+        if pending:
+            session_id = pending["session_id"]
+            question_id = pending["question_id"]
+            
+            try:
+                from opencode.client import OpenCodeClient
+                async with OpenCodeClient() as oc_client:
+                    await oc_client.respond_to_question(
+                        session_id=session_id,
+                        question_id=question_id,
+                        answer=message_text
+                    )
+                
+                pending_questions.pop(short_key, None)
+                context.user_data.pop("awaiting_question_answer", None)
+                
+                await update.message.reply_text(
+                    f"✅ Answer submitted: <code>{html.escape(message_text)}</code>",
+                    parse_mode="HTML"
+                )
+                return
+            except Exception as e:
+                logger.error(f"Failed to submit question answer: {e}", exc_info=True)
+                await update.message.reply_text(
+                    f"⚠️ Failed to submit answer: {e}",
+                    parse_mode="HTML"
+                )
+                return
+        else:
+            context.user_data.pop("awaiting_question_answer", None)
+
     # ── Check if user is in the middle of adding an agent skill ──────
     skill_state = context.user_data.get("skill_state")
     if skill_state:
@@ -646,6 +684,55 @@ async def _listen_and_stream_events(
                                     parse_mode="HTML",
                                     reply_markup=InlineKeyboardMarkup(keyboard)
                                 )
+
+                            elif event_type == "question.asked":
+                                question_id = properties.get("id") or properties.get("questionID") or payload.get("id")
+                                question_text = properties.get("question") or properties.get("text") or ""
+                                options = properties.get("options", [])
+                                custom_allowed = properties.get("custom", True)
+
+                                if not question_id:
+                                    logger.warning("Received question.asked event but no question ID was found.")
+                                    continue
+
+                                if "pending_questions" not in context.bot_data:
+                                    context.bot_data["pending_questions"] = {}
+
+                                short_key = uuid.uuid4().hex[:8]
+                                context.bot_data["pending_questions"][short_key] = {
+                                    "session_id": session_id,
+                                    "question_id": question_id
+                                }
+
+                                msg = f"❓ <b>Question from OpenCode</b>\n\n{html.escape(question_text)}"
+
+                                keyboard = []
+                                if options:
+                                    for idx, option in enumerate(options):
+                                        if isinstance(option, dict):
+                                            label = option.get("label", f"Option {idx+1}")
+                                            value = option.get("value", label)
+                                        else:
+                                            label = str(option)
+                                            value = label
+                                        
+                                        keyboard.append([InlineKeyboardButton(
+                                            label,
+                                            callback_data=f"question:{short_key}:{value[:40]}"
+                                        )])
+                                
+                                if custom_allowed:
+                                    msg += "\n\n<i>Or reply with your own answer in text.</i>"
+                                
+                                if keyboard:
+                                    await update.message.reply_text(
+                                        msg,
+                                        parse_mode="HTML",
+                                        reply_markup=InlineKeyboardMarkup(keyboard)
+                                    )
+                                else:
+                                    await update.message.reply_text(msg, parse_mode="HTML")
+                                    context.user_data["awaiting_question_answer"] = short_key
 
                             # B. Handle Tool Execution Progress
                             elif event_type == "message.part.updated":
