@@ -704,7 +704,7 @@ async def _listen_and_stream_events(
                                     "question_id": question_id
                                 }
 
-                                msg = f"❓ <b>Question from OpenCode</b>\n\n{html.escape(question_text[:500])}"
+                                msg = f"❓ <b>Question from OpenCode</b>\n\n{html.escape(question_text)}"
 
                                 keyboard = []
                                 MAX_OPTIONS = 10
@@ -731,21 +731,24 @@ async def _listen_and_stream_events(
                                     msg += "\n\n<i>Or reply with your own answer in text.</i>"
                                 
                                 try:
+                                    chunks = split_message(msg, context.bot_data["config"].max_message_length)
                                     if keyboard:
+                                        for chunk in chunks[:-1]:
+                                            await update.message.reply_text(chunk, parse_mode="HTML")
                                         await update.message.reply_text(
-                                            msg,
+                                            chunks[-1],
                                             parse_mode="HTML",
                                             reply_markup=InlineKeyboardMarkup(keyboard)
                                         )
                                     else:
-                                        await update.message.reply_text(msg, parse_mode="HTML")
+                                        for chunk in chunks:
+                                            await update.message.reply_text(chunk, parse_mode="HTML")
                                         context.user_data["awaiting_question_answer"] = short_key
                                 except Exception as e:
                                     logger.error(f"Failed to send question prompt: {e}")
-                                    await update.message.reply_text(
-                                        f"❓ Question: {html.escape(question_text[:200])}\n\n<i>Please reply with your answer.</i>",
-                                        parse_mode="HTML"
-                                    )
+                                    fallback_msg = f"❓ Question:\n\n{html.escape(question_text)}\n\n<i>Please reply with your answer.</i>"
+                                    for chunk in split_message(fallback_msg, context.bot_data["config"].max_message_length):
+                                        await update.message.reply_text(chunk, parse_mode="HTML")
                                     context.user_data["awaiting_question_answer"] = short_key
 
                             # B. Handle Tool Execution Progress
@@ -1587,4 +1590,3 @@ async def handle_skill_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
         
         await render_skills_list(update, context, user_id, current_dir)
-

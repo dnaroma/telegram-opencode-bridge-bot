@@ -707,8 +707,10 @@ async def _listen_and_stream_events(
                                 msg = f"❓ <b>Question from OpenCode</b>\n\n{html.escape(question_text)}"
 
                                 keyboard = []
+                                MAX_OPTIONS = 10
                                 if options:
-                                    for idx, option in enumerate(options):
+                                    limited_options = options[:MAX_OPTIONS]
+                                    for idx, option in enumerate(limited_options):
                                         if isinstance(option, dict):
                                             label = option.get("label", f"Option {idx+1}")
                                             value = option.get("value", label)
@@ -716,22 +718,37 @@ async def _listen_and_stream_events(
                                             label = str(option)
                                             value = label
                                         
+                                        label_short = label[:50]
                                         keyboard.append([InlineKeyboardButton(
-                                            label,
+                                            label_short,
                                             callback_data=f"question:{short_key}:{value[:40]}"
                                         )])
+                                    
+                                    if len(options) > MAX_OPTIONS:
+                                        msg += f"\n\n<i>(Showing {MAX_OPTIONS} of {len(options)} options)</i>"
                                 
                                 if custom_allowed:
                                     msg += "\n\n<i>Or reply with your own answer in text.</i>"
                                 
-                                if keyboard:
-                                    await update.message.reply_text(
-                                        msg,
-                                        parse_mode="HTML",
-                                        reply_markup=InlineKeyboardMarkup(keyboard)
-                                    )
-                                else:
-                                    await update.message.reply_text(msg, parse_mode="HTML")
+                                try:
+                                    chunks = split_message(msg, context.bot_data["config"].max_message_length)
+                                    if keyboard:
+                                        for chunk in chunks[:-1]:
+                                            await update.message.reply_text(chunk, parse_mode="HTML")
+                                        await update.message.reply_text(
+                                            chunks[-1],
+                                            parse_mode="HTML",
+                                            reply_markup=InlineKeyboardMarkup(keyboard)
+                                        )
+                                    else:
+                                        for chunk in chunks:
+                                            await update.message.reply_text(chunk, parse_mode="HTML")
+                                        context.user_data["awaiting_question_answer"] = short_key
+                                except Exception as e:
+                                    logger.error(f"Failed to send question prompt: {e}")
+                                    fallback_msg = f"❓ Question:\n\n{html.escape(question_text)}\n\n<i>Please reply with your answer.</i>"
+                                    for chunk in split_message(fallback_msg, context.bot_data["config"].max_message_length):
+                                        await update.message.reply_text(chunk, parse_mode="HTML")
                                     context.user_data["awaiting_question_answer"] = short_key
 
                             # B. Handle Tool Execution Progress
@@ -1573,4 +1590,3 @@ async def handle_skill_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
         
         await render_skills_list(update, context, user_id, current_dir)
-
