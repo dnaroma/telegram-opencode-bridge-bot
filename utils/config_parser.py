@@ -8,6 +8,8 @@ logger = logging.getLogger(__name__)
 
 def _config_candidates(work_dir: str) -> list[str]:
     return [
+        os.path.join(work_dir, "opencode.jsonc"),
+        os.path.join(work_dir, "opencode.json"),
         os.path.join(work_dir, ".opencode", "opencode.jsonc"),
         os.path.join(work_dir, ".opencode", "opencode.json"),
         os.path.expanduser("~/.config/opencode/opencode.jsonc"),
