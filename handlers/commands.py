@@ -1813,6 +1813,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     parse_mode="HTML"
                 )
                 return
+            
+            if answer == "__custom__":
+                context.user_data["awaiting_question_answer"] = short_key
+                await query.edit_message_text(
+                    text=f"{query.message.text}\n\n✏️ <i>Please type your custom answer as a regular message.</i>",
+                    parse_mode="HTML"
+                )
+                return
                 
             session_id = pending["session_id"]
             question_id = pending["question_id"]

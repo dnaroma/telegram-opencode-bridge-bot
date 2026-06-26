@@ -8,6 +8,7 @@ through here to OpenCode's HTTP API (or subprocess fallback).
 import logging
 import asyncio
 import os
+import html
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
@@ -120,15 +121,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if pending:
             session_id = pending["session_id"]
             question_id = pending["question_id"]
+            oc_client = context.bot_data.get("opencode_client")
             
             try:
-                from opencode.client import OpenCodeClient
-                async with OpenCodeClient() as oc_client:
-                    await oc_client.respond_to_question(
-                        session_id=session_id,
-                        question_id=question_id,
-                        answer=message_text
-                    )
+                if not oc_client:
+                    raise RuntimeError("OpenCode client not available")
+                await oc_client.respond_to_question(
+                    session_id=session_id,
+                    question_id=question_id,
+                    answer=message_text
+                )
                 
                 pending_questions.pop(short_key, None)
                 context.user_data.pop("awaiting_question_answer", None)
@@ -693,70 +695,93 @@ async def _listen_and_stream_events(
                                 )
 
                             elif event_type == "question.asked":
-                                question_id = properties.get("id") or properties.get("questionID") or payload.get("id")
-                                question_text = properties.get("question") or properties.get("text") or ""
-                                options = properties.get("options", [])
-                                custom_allowed = properties.get("custom", True)
+                                question_id = properties.get("id") or payload.get("id")
+                                event_session_id = properties.get("sessionID") or properties.get("sessionId") or ""
+                                questions_list = properties.get("questions", [])
+                                tool_info = properties.get("tool", {}) if isinstance(properties.get("tool"), dict) else {}
 
                                 if not question_id:
                                     logger.warning("Received question.asked event but no question ID was found.")
                                     continue
 
+                                if not isinstance(questions_list, list) or not questions_list:
+                                    logger.warning("Received question.asked event but no questions array found in properties.")
+                                    continue
+
                                 if "pending_questions" not in context.bot_data:
                                     context.bot_data["pending_questions"] = {}
 
-                                short_key = uuid.uuid4().hex[:8]
-                                context.bot_data["pending_questions"][short_key] = {
-                                    "session_id": session_id,
-                                    "question_id": question_id
-                                }
+                                for q_idx, q_item in enumerate(questions_list):
+                                    q_header = q_item.get("header", "")
+                                    q_text = q_item.get("question", "")
+                                    q_options = q_item.get("options", [])
+                                    q_multiple = q_item.get("multiple", False)
+                                    q_custom = q_item.get("custom", True)
 
-                                msg = f"❓ <b>Question from OpenCode</b>\n\n{html.escape(question_text)}"
+                                    if not q_text:
+                                        continue
 
-                                keyboard = []
-                                MAX_OPTIONS = 10
-                                if options:
-                                    limited_options = options[:MAX_OPTIONS]
-                                    for idx, option in enumerate(limited_options):
-                                        if isinstance(option, dict):
-                                            label = option.get("label", f"Option {idx+1}")
-                                            value = option.get("value", label)
+                                    short_key = uuid.uuid4().hex[:8]
+                                    context.bot_data["pending_questions"][short_key] = {
+                                        "session_id": session_id,
+                                        "question_id": question_id,
+                                    }
+
+                                    header_prefix = f"<b>{html.escape(q_header)}</b>\n\n" if q_header else ""
+                                    msg = f"❓ {header_prefix}{html.escape(q_text)}"
+                                    if q_multiple:
+                                        msg += "\n\n<i>You may select multiple options.</i>"
+
+                                    keyboard = []
+                                    MAX_Q_OPTIONS = 10
+                                    display_options = q_options[:MAX_Q_OPTIONS] if isinstance(q_options, list) else []
+
+                                    for idx, opt in enumerate(display_options):
+                                        if isinstance(opt, dict):
+                                            label = opt.get("label", f"Option {idx+1}")
+                                            desc = opt.get("description", "")
+                                            display_label = label[:50]
+                                            if desc and len(label) + len(desc) < 55:
+                                                display_label = f"{label[:30]} — {desc[:20]}"
+                                            cb_value = label[:40]
                                         else:
-                                            label = str(option)
-                                            value = label
-                                        
-                                        label_short = label[:50]
+                                            display_label = str(opt)[:50]
+                                            cb_value = display_label
+
                                         keyboard.append([InlineKeyboardButton(
-                                            label_short,
-                                            callback_data=f"question:{short_key}:{value[:40]}"
+                                            display_label,
+                                            callback_data=f"question:{short_key}:{cb_value}"
                                         )])
-                                    
-                                    if len(options) > MAX_OPTIONS:
-                                        msg += f"\n\n<i>(Showing {MAX_OPTIONS} of {len(options)} options)</i>"
-                                
-                                if custom_allowed:
-                                    msg += "\n\n<i>Or reply with your own answer in text.</i>"
-                                
-                                try:
-                                    chunks = split_message(msg, context.bot_data["config"].max_message_length)
-                                    if keyboard:
-                                        for chunk in chunks[:-1]:
-                                            await update.message.reply_text(chunk, parse_mode="HTML")
-                                        await update.message.reply_text(
-                                            chunks[-1],
-                                            parse_mode="HTML",
-                                            reply_markup=InlineKeyboardMarkup(keyboard)
-                                        )
-                                    else:
-                                        for chunk in chunks:
+
+                                    if isinstance(q_options, list) and len(q_options) > MAX_Q_OPTIONS:
+                                        msg += f"\n\n<i>(Showing {MAX_Q_OPTIONS} of {len(q_options)} options)</i>"
+
+                                    if q_custom:
+                                        keyboard.append([InlineKeyboardButton(
+                                            "✏️ Type custom answer",
+                                            callback_data=f"question:{short_key}:__custom__"
+                                        )])
+
+                                    try:
+                                        chunks = split_message(msg, context.bot_data["config"].max_message_length)
+                                        if keyboard:
+                                            for chunk in chunks[:-1]:
+                                                await update.message.reply_text(chunk, parse_mode="HTML")
+                                            await update.message.reply_text(
+                                                chunks[-1],
+                                                parse_mode="HTML",
+                                                reply_markup=InlineKeyboardMarkup(keyboard)
+                                            )
+                                        else:
+                                            for chunk in chunks:
+                                                await update.message.reply_text(chunk, parse_mode="HTML")
+                                            context.user_data["awaiting_question_answer"] = short_key
+                                    except Exception as e:
+                                        logger.error(f"Failed to send question prompt: {e}")
+                                        fallback_msg = f"❓ Question:\n\n{html.escape(q_text)}\n\n<i>Please reply with your answer.</i>"
+                                        for chunk in split_message(fallback_msg, context.bot_data["config"].max_message_length):
                                             await update.message.reply_text(chunk, parse_mode="HTML")
                                         context.user_data["awaiting_question_answer"] = short_key
-                                except Exception as e:
-                                    logger.error(f"Failed to send question prompt: {e}")
-                                    fallback_msg = f"❓ Question:\n\n{html.escape(question_text)}\n\n<i>Please reply with your answer.</i>"
-                                    for chunk in split_message(fallback_msg, context.bot_data["config"].max_message_length):
-                                        await update.message.reply_text(chunk, parse_mode="HTML")
-                                    context.user_data["awaiting_question_answer"] = short_key
 
                             # B. Handle Tool Execution Progress
                             elif event_type == "message.part.updated":
@@ -798,10 +823,95 @@ async def _listen_and_stream_events(
                                             query = input_data.get("query") or input_data.get("url") or ""
                                             query_truncated = truncate(query, 60)
                                             status_text = f"🌐 <b>Searching web...</b>\n<code>{html.escape(query_truncated)}</code>"
+                                        elif tool_name == "question":
+                                            status_text = "❓ <b>Waiting for your answer...</b>"
                                         else:
                                             status_text = f"⚙️ <b>Executing tool <code>{html.escape(tool_name)}</code>...</b>"
                                         
                                         await update_status(status_text)
+
+                                    # ── 1b. Handle Question Tool (Always Active) ──
+                                    if tool_name == "question" and status in ("pending", "running") and call_id not in notified_calls:
+                                        notified_calls.add(call_id)
+                                        completed_calls.add(call_id)
+
+                                        if not isinstance(input_data, dict):
+                                            continue
+
+                                        questions_list = input_data.get("questions", [])
+                                        if not isinstance(questions_list, list) or not questions_list:
+                                            continue
+
+                                        for q_item in questions_list:
+                                            q_header = q_item.get("header", "")
+                                            q_text = q_item.get("question", "")
+                                            q_options = q_item.get("options", [])
+                                            q_multiple = q_item.get("multiple", False)
+
+                                            if not q_text:
+                                                continue
+
+                                            if "pending_questions" not in context.bot_data:
+                                                context.bot_data["pending_questions"] = {}
+
+                                            question_key = uuid.uuid4().hex[:8]
+                                            context.bot_data["pending_questions"][question_key] = {
+                                                "session_id": session_id,
+                                                "call_id": call_id,
+                                            }
+
+                                            header_prefix = f"<b>{html.escape(q_header)}</b>\n\n" if q_header else ""
+                                            msg = f"❓ {header_prefix}{html.escape(q_text)}"
+                                            if q_multiple:
+                                                msg += "\n\n<i>You may select multiple options.</i>"
+
+                                            keyboard = []
+                                            MAX_Q_OPTIONS = 10
+                                            display_options = q_options[:MAX_Q_OPTIONS] if isinstance(q_options, list) else []
+
+                                            for idx, opt in enumerate(display_options):
+                                                if isinstance(opt, dict):
+                                                    label = opt.get("label", f"Option {idx+1}")
+                                                    value = opt.get("value", label)
+                                                    desc = opt.get("description", "")
+                                                    display_label = f"{label[:50]}"
+                                                    if desc and len(label) + len(desc) < 55:
+                                                        display_label = f"{label[:30]} — {desc[:20]}"
+                                                    cb_value = value[:40]
+                                                else:
+                                                    display_label = str(opt)[:50]
+                                                    cb_value = display_label
+
+                                                keyboard.append([InlineKeyboardButton(
+                                                    display_label,
+                                                    callback_data=f"question:{question_key}:{cb_value}"
+                                                )])
+
+                                            if isinstance(q_options, list) and len(q_options) > MAX_Q_OPTIONS:
+                                                msg += f"\n\n<i>(Showing {MAX_Q_OPTIONS} of {len(q_options)} options)</i>"
+
+                                            keyboard.append([InlineKeyboardButton(
+                                                "✏️ Type custom answer",
+                                                callback_data=f"question:{question_key}:__custom__"
+                                            )])
+
+                                            try:
+                                                chunks = split_message(msg, context.bot_data["config"].max_message_length)
+                                                for chunk in chunks[:-1]:
+                                                    await update.message.reply_text(chunk, parse_mode="HTML")
+                                                await update.message.reply_text(
+                                                    chunks[-1],
+                                                    parse_mode="HTML",
+                                                    reply_markup=InlineKeyboardMarkup(keyboard)
+                                                )
+                                            except Exception as e:
+                                                logger.error(f"Failed to send question prompt: {e}")
+                                                try:
+                                                    fallback = f"❓ {html.escape(q_text)}\n\n<i>Please reply with your answer.</i>"
+                                                    await update.message.reply_text(fallback, parse_mode="HTML")
+                                                    context.user_data["awaiting_question_answer"] = question_key
+                                                except Exception:
+                                                    pass
 
                                     # ── 2. Stream Full Tool Logs (Only if is_streaming is True) ──
                                     if is_streaming:
