@@ -597,8 +597,14 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     oc_available = await oc_client.is_available()
     session_info = await session_mgr.get_session_info(user_id)
+    effective_model = await session_mgr.get_effective_model(user_id)
 
-    status_text = format_status(oc_available, session_info, config.opencode_model)
+    status_text = format_status(
+        oc_available,
+        session_info,
+        effective_model,
+        config.bot_version,
+    )
     await update.message.reply_text(status_text, parse_mode="HTML")
 
 

@@ -212,6 +212,20 @@ class SessionManager:
                 return row[0]
         return default_model
 
+    async def get_effective_model(self, user_id: int) -> str | None:
+        session = self._active_sessions.get(user_id)
+        if session and session.get("model"):
+            return str(session["model"])
+
+        async with self._db.execute(
+            "SELECT model FROM user_settings WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0]:
+                return str(row[0])
+        return None
+
     async def set_user_preferred_model(self, user_id: int, model: str) -> None:
         """Save or update the preferred model for a user in their settings."""
         await self._db.execute(

@@ -1,6 +1,6 @@
-import re
 import html
 import logging
+import re
 from typing import List, Tuple
 
 logger = logging.getLogger(__name__)
@@ -340,29 +340,31 @@ def format_error(error_msg: str) -> str:
 def format_status(
     opencode_available: bool,
     session_info: dict | None,
-    model: str,
+    model: str | None,
     bot_version: str,
 ) -> str:
     """Format bot status for display."""
     oc_status = "🟢 Connected" if opencode_available else "🔴 Disconnected"
+    model_display = model or "Agent default (server-selected)"
     
     lines = [
         "<b>📊 Bot Status</b>",
         "",
         f"Bot Version: <code>v{bot_version}</code>",
         f"OpenCode Server: {oc_status}",
-        f"Default Model: <code>{html.escape(model)}</code>",
+        f"Default Model: <code>{html.escape(model_display)}</code>",
     ]
     
     if session_info:
         sid = session_info.get('session_id', 'none')[:8]
+        session_model = session_info.get("model") or model_display
         lines.extend([
             "",
             "<b>Current Session:</b>",
             f"  ID: <code>{sid}</code>",
             f"  Mode: {session_info.get('mode', 'build')}",
             f"  Messages: {session_info.get('message_count', 0)}",
-            f"  Model: <code>{html.escape(session_info.get('model', 'default') or 'default')}</code>",
+            f"  Model: <code>{html.escape(session_model)}</code>",
         ])
     else:
         lines.append("\nNo active session. Send a message to start one.")
