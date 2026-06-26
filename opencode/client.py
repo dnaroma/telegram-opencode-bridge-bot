@@ -433,47 +433,19 @@ class OpenCodeClient:
 
     async def get_available_models(self) -> Dict[str, Any]:
         """Fetch all available models and providers from the server."""
-        session = await self._get_session()
-        url = f"{self.server_url}/provider"
-        headers = {"Accept": "application/json"}
-        
-        async with session.get(url, headers=headers) as resp:
-            if resp.status >= 400:
-                body = await resp.text()
-                raise OpenCodeAPIError(resp.status, body)
-            
-            content_type = resp.headers.get("Content-Type", "")
-            if "json" in content_type:
-                return await resp.json()
-            
-            text = await resp.text()
-            try:
-                import json
-                return json.loads(text)
-            except ValueError:
-                return {}
+        result = await self._request("GET", "/provider")
+        if isinstance(result, dict):
+            return result
+        return {}
 
     async def get_available_agents(self) -> List[Dict[str, Any]]:
         """Fetch all available agents from the server."""
-        session = await self._get_session()
-        url = f"{self.server_url}/agent"
-        headers = {"Accept": "application/json"}
-        
-        async with session.get(url, headers=headers) as resp:
-            if resp.status >= 400:
-                body = await resp.text()
-                raise OpenCodeAPIError(resp.status, body)
-            
-            content_type = resp.headers.get("Content-Type", "")
-            if "json" in content_type:
-                return await resp.json()
-            
-            text = await resp.text()
-            try:
-                import json
-                return json.loads(text)
-            except ValueError:
-                return []
+        result = await self._request("GET", "/agent")
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            return result.get("agents", result.get("data", []))
+        return []
 
     async def abort_session(self, session_id: str) -> bool:
         """Send an abort signal to stop active model processing in a session."""
@@ -588,27 +560,9 @@ class OpenCodeClient:
 
     async def get_mcp_status(self) -> Any:
         """Fetch status and connectivity details of registered MCP servers from the server."""
-        session = await self._get_session()
-        url = f"{self.server_url}/mcp"
-        headers = {"Accept": "application/json"}
-        try:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status >= 400:
-                    body = await resp.text()
-                    raise OpenCodeAPIError(resp.status, body)
-                
-                content_type = resp.headers.get("Content-Type", "")
-                if "json" in content_type:
-                    return await resp.json()
-                
-                text = await resp.text()
-                try:
-                    import json
-                    return json.loads(text)
-                except ValueError:
-                    return {}
-        except Exception as e:
-            logger.error(f"Failed to fetch MCP status from server: {e}")
-            raise
+        result = await self._request("GET", "/mcp")
+        if isinstance(result, dict):
+            return result
+        return {}
 
 

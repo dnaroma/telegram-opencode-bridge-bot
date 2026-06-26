@@ -18,6 +18,7 @@ import asyncio
 import logging
 import sys
 import os
+import time
 
 # Switch to Selector Event Loop on Windows for robust signal handling and clean shutdowns
 if sys.platform == 'win32':
@@ -462,8 +463,96 @@ DB_PATH=sessions.db
         print(f"\n❌ Error writing to .env file: {e}")
 
 
+def _build_application():
+    """Construct and return a fully-wired Telegram Application (no side effects)."""
+    authorizer = UserAuthorizer(config.authorized_users)
+    rate_limiter = RateLimiter(max_requests=20, window_seconds=60)
+
+    oc_client = OpenCodeClient(
+        server_url=config.opencode_server_url,
+        username=config.opencode_server_username,
+        password=config.opencode_server_password,
+        timeout=config.response_timeout,
+    )
+
+    session_mgr = SessionManager(db_path=config.db_path)
+
+    request = RetryingHTTPXRequest(
+        connect_timeout=15.0,
+        read_timeout=20.0,
+        write_timeout=20.0,
+        pool_timeout=5.0,
+        connection_pool_size=512,
+    )
+
+    application = (
+        ApplicationBuilder()
+        .token(config.telegram_bot_token)
+        .request(request)
+        .get_updates_request(request)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    application.add_error_handler(error_handler)
+
+    application.bot_data["config"] = config
+    application.bot_data["opencode_client"] = oc_client
+    application.bot_data["session_manager"] = session_mgr
+    application.bot_data["server_started"] = False
+
+    handlers = build_authorized_handlers(authorizer, rate_limiter)
+
+    application.add_handler(CommandHandler("start", handlers["start"], block=False))
+    application.add_handler(CommandHandler("help", handlers["help"], block=False))
+    application.add_handler(CommandHandler("new", handlers["new"], block=False))
+    application.add_handler(CommandHandler("sessions", handlers["sessions"], block=False))
+    application.add_handler(CommandHandler("delete", handlers["delete"], block=False))
+    application.add_handler(CommandHandler("models", handlers["models"], block=False))
+    application.add_handler(CommandHandler("stop", handlers["stop"], block=False))
+    application.add_handler(CommandHandler("project", handlers["project"], block=False))
+    application.add_handler(CommandHandler("create_project", handlers["create_project"], block=False))
+    application.add_handler(CommandHandler("delete_project", handlers["delete_project"], block=False))
+    application.add_handler(CommandHandler("enable", handlers["enable"], block=False))
+    application.add_handler(CommandHandler("disable", handlers["disable"], block=False))
+    application.add_handler(CommandHandler("history", handlers["history"], block=False))
+    application.add_handler(CommandHandler("mode", handlers["mode"], block=False))
+    application.add_handler(CommandHandler("plan", handlers["plan"], block=False))
+    application.add_handler(CommandHandler("build", handlers["build"], block=False))
+    application.add_handler(CommandHandler("share", handlers["share"], block=False))
+    application.add_handler(CommandHandler("status", handlers["status"], block=False))
+    application.add_handler(CommandHandler("id", handlers["id"], block=False))
+    application.add_handler(CommandHandler("mcps", handlers["mcps"], block=False))
+    application.add_handler(CommandHandler("skills", handlers["skills"], block=False))
+
+    application.add_handler(CallbackQueryHandler(handlers["callback"], block=False))
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handlers["message"],
+            block=False,
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            (filters.Document.ALL | filters.PHOTO) & ~filters.COMMAND,
+            handlers["document"],
+            block=False,
+        )
+    )
+
+    return application
+
+
+MAX_CRASH_RESTARTS = 10
+CRASH_RESTART_COOLDOWN = 30  # seconds — reset crash counter after this long stable
+
+
 def main():
-    """Build and run the Telegram bot."""
+    """Build and run the Telegram bot with automatic crash recovery."""
 
     # If --env CLI flag is passed, or if .env does not exist, run setup
     if "--env" in sys.argv:
@@ -504,100 +593,57 @@ def main():
     logger.info(f"  Authorized Users: {len(config.authorized_users)}")
     logger.info("=" * 50)
 
-    # ── Initialize components ─────────────────────────────
-    authorizer = UserAuthorizer(config.authorized_users)
-    rate_limiter = RateLimiter(max_requests=20, window_seconds=60)
+    # ── Crash-resilient restart loop ──────────────────────
+    crash_count = 0
+    last_crash_time = 0.0
 
-    oc_client = OpenCodeClient(
-        server_url=config.opencode_server_url,
-        username=config.opencode_server_username,
-        password=config.opencode_server_password,
-        timeout=config.response_timeout,
-    )
+    while True:
+        try:
+            application = _build_application()
 
-    session_mgr = SessionManager(db_path=config.db_path)
+            logger.info("Starting bot with long polling...")
+            application.run_polling(
+                drop_pending_updates=True,
+                allowed_updates=["message", "callback_query"],
+            )
 
-    # ── Build Telegram application ────────────────────────
-    request = RetryingHTTPXRequest(
-        connect_timeout=15.0,
-        read_timeout=20.0,
-        write_timeout=20.0,
-        pool_timeout=5.0,
-        connection_pool_size=512,
-    )
+            # If run_polling() returns cleanly (e.g. SIGINT), exit normally
+            logger.info("Bot polling stopped cleanly.")
+            break
 
-    application = (
-        ApplicationBuilder()
-        .token(config.telegram_bot_token)
-        .request(request)
-        .get_updates_request(request)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
+        except KeyboardInterrupt:
+            logger.info("Received KeyboardInterrupt — shutting down.")
+            break
 
-    # ── Register global error handler ─────────────────────
-    application.add_error_handler(error_handler)
+        except SystemExit:
+            raise
 
-    # Store components in bot_data for access in handlers
-    application.bot_data["config"] = config
-    application.bot_data["opencode_client"] = oc_client
-    application.bot_data["session_manager"] = session_mgr
-    application.bot_data["server_started"] = False
+        except Exception as fatal:
+            now = time.time()
+            # Reset crash counter if bot was stable for CRASH_RESTART_COOLDOWN seconds
+            if (now - last_crash_time) > CRASH_RESTART_COOLDOWN:
+                crash_count = 0
 
-    # ── Build auth-wrapped handlers ───────────────────────
-    handlers = build_authorized_handlers(authorizer, rate_limiter)
+            crash_count += 1
+            last_crash_time = now
 
-    # ── Register command handlers ─────────────────────────
-    application.add_handler(CommandHandler("start", handlers["start"], block=False))
-    application.add_handler(CommandHandler("help", handlers["help"], block=False))
-    application.add_handler(CommandHandler("new", handlers["new"], block=False))
-    application.add_handler(CommandHandler("sessions", handlers["sessions"], block=False))
-    application.add_handler(CommandHandler("delete", handlers["delete"], block=False))
-    application.add_handler(CommandHandler("models", handlers["models"], block=False))
-    application.add_handler(CommandHandler("stop", handlers["stop"], block=False))
-    application.add_handler(CommandHandler("project", handlers["project"], block=False))
-    application.add_handler(CommandHandler("create_project", handlers["create_project"], block=False))
-    application.add_handler(CommandHandler("delete_project", handlers["delete_project"], block=False))
-    application.add_handler(CommandHandler("enable", handlers["enable"], block=False))
-    application.add_handler(CommandHandler("disable", handlers["disable"], block=False))
-    application.add_handler(CommandHandler("history", handlers["history"], block=False))
-    application.add_handler(CommandHandler("mode", handlers["mode"], block=False))
-    application.add_handler(CommandHandler("plan", handlers["plan"], block=False))
-    application.add_handler(CommandHandler("build", handlers["build"], block=False))
-    application.add_handler(CommandHandler("share", handlers["share"], block=False))
-    application.add_handler(CommandHandler("status", handlers["status"], block=False))
-    application.add_handler(CommandHandler("id", handlers["id"], block=False))
-    application.add_handler(CommandHandler("mcps", handlers["mcps"], block=False))
-    application.add_handler(CommandHandler("skills", handlers["skills"], block=False))
+            if crash_count > MAX_CRASH_RESTARTS:
+                logger.critical(
+                    "💥 Bot crashed %d times within %ds — giving up to prevent restart loop. "
+                    "Last error: %s",
+                    crash_count, CRASH_RESTART_COOLDOWN, fatal,
+                    exc_info=True,
+                )
+                sys.exit(1)
 
-    # ── Register callback query handler ───────────────────
-    application.add_handler(CallbackQueryHandler(handlers["callback"], block=False))
-
-    # ── Register message handler (catches all text) ───────
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handlers["message"],
-            block=False,
-        )
-    )
-
-    # ── Register document handler (catches file uploads) ──
-    application.add_handler(
-        MessageHandler(
-            (filters.Document.ALL | filters.PHOTO) & ~filters.COMMAND,
-            handlers["document"],
-            block=False,
-        )
-    )
-
-    # ── Start polling ─────────────────────────────────────
-    logger.info("Starting bot with long polling...")
-    application.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=["message", "callback_query"],
-    )
+            backoff = min(5 * crash_count, 60)  # 5s, 10s, 15s … 60s cap
+            logger.error(
+                "💥 Unhandled crash #%d/%d: %s\n"
+                "Restarting in %ds…",
+                crash_count, MAX_CRASH_RESTARTS, fatal, backoff,
+                exc_info=True,
+            )
+            time.sleep(backoff)
 
 
 if __name__ == "__main__":
