@@ -5,18 +5,21 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def _config_candidates(work_dir: str) -> list[str]:
+    return [
+        os.path.join(work_dir, ".opencode", "opencode.jsonc"),
+        os.path.join(work_dir, ".opencode", "opencode.json"),
+        os.path.expanduser("~/.config/opencode/opencode.jsonc"),
+        os.path.expanduser("~/.config/opencode/opencode.json"),
+    ]
+
 def find_config_file(work_dir: str) -> str:
     """Locate the opencode config file in workspace or global config.
     Returns the absolute path to the file.
     If none exist, returns the default path to write to: <work_dir>/.opencode/opencode.json
     """
-    paths = [
-        os.path.join(work_dir, ".opencode", "opencode.jsonc"),
-        os.path.join(work_dir, ".opencode", "opencode.json"),
-        os.path.expanduser("~/.config/opencode/opencode.jsonc"),
-        os.path.expanduser("~/.config/opencode/opencode.json")
-    ]
-    for p in paths:
+    for p in _config_candidates(work_dir):
         if os.path.exists(p) and os.path.isfile(p):
             return os.path.abspath(p)
     
@@ -65,10 +68,14 @@ def save_config(file_path: str, config: dict) -> None:
         raise
 
 def get_mcp_servers(work_dir: str) -> dict:
-    """Get all MCP server configurations from the config file."""
-    config_file = find_config_file(work_dir)
-    config = read_config(config_file)
-    return config.get("mcp", {})
+    merged: dict = {}
+
+    for config_file in reversed(_config_candidates(work_dir)):
+        config = read_config(config_file)
+        if "mcp" in config:
+            merged.update(config["mcp"])
+
+    return merged
 
 def update_mcp_servers(work_dir: str, mcp_servers: dict) -> None:
     """Update the entire mcp section in the config file."""
