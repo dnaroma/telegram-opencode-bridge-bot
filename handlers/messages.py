@@ -158,67 +158,71 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     status_msg = None
+    status_msg_holder = None
+    sse_task = None
+    typing_task = None
 
     bot_data = context.bot_data
     session_mgr = bot_data["session_manager"]
     oc_client = bot_data["opencode_client"]
     config = bot_data["config"]
 
-    # ── 1. Ensure OpenCode server is running ────────────────
-    if not await ensure_server_running(update, context, user_id):
-        return
-
-    # ── 2. Send typing indicator ──────────────────────────
-    await update.message.chat.send_action(ChatAction.TYPING)
-
-    # ── 3. Get or create session ──────────────────────────
-    session_id = await session_mgr.get_active_session(user_id)
-
-    if not session_id:
-        # Create a new OpenCode session
-        try:
-            session_id = await _create_session(oc_client, user_id, session_mgr, config)
-        except Exception as e:
-            logger.error(f"Failed to create session: {e}", exc_info=True)
-            await update.message.reply_text(
-                format_error(f"Failed to create session: {e}"),
-                parse_mode="HTML",
-            )
+    try:
+        # ── 1. Ensure OpenCode server is running ────────────────
+        if not await ensure_server_running(update, context, user_id):
             return
 
-    # ── 4. Send prompt to OpenCode ────────────────────────
-    # Check if streaming is enabled
-    is_streaming = await session_mgr.get_user_streaming(user_id, 0)
-    
-    # Send a premium dynamic phase status message to keep user informed in real-time
-    status_msg = await update.message.reply_text(
-        "🧠 <b>Thinking...</b>\n<i>Analyzing request and preparing a plan...</i>",
-        parse_mode="HTML"
-    )
-    
-    status_msg_holder = [status_msg]
-    
-    # Always spawn the SSE event stream listener so we can handle interactive permission prompts
-    # (e.g. for sensitive files like .env) even if the user has disabled regular tool-call progress.
-    sse_task = asyncio.create_task(
-        _listen_and_stream_events(
-            update=update,
-            context=context,
-            session_id=session_id,
-            server_url=config.opencode_server_url,
-            is_streaming=bool(is_streaming == 1),
-            status_msg_holder=status_msg_holder
-        )
-    )
+        # ── 2. Send typing indicator ──────────────────────────
+        await update.message.chat.send_action(ChatAction.TYPING)
 
-    typing_task = asyncio.create_task(
-        _keep_typing(update, config.response_timeout)
-    )
-    before_ids = set()
-    sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
-    sent_message_ids.clear()
-    session_mgr.set_session_running(user_id, True)
-    try:
+        # ── 3. Get or create session ──────────────────────────
+        session_id = await session_mgr.get_active_session(user_id)
+
+        if not session_id:
+            # Create a new OpenCode session
+            try:
+                session_id = await _create_session(oc_client, user_id, session_mgr, config)
+            except Exception as e:
+                logger.error(f"Failed to create session: {e}", exc_info=True)
+                await update.message.reply_text(
+                    format_error(f"Failed to create session: {e}"),
+                    parse_mode="HTML",
+                )
+                return
+
+        # ── 4. Send prompt to OpenCode ────────────────────────
+        # Check if streaming is enabled
+        is_streaming = await session_mgr.get_user_streaming(user_id, 0)
+
+        # Send a premium dynamic phase status message to keep user informed in real-time
+        status_msg = await update.message.reply_text(
+            "🧠 <b>Thinking...</b>\n<i>Analyzing request and preparing a plan...</i>",
+            parse_mode="HTML"
+        )
+
+        status_msg_holder = [status_msg]
+
+        # Always spawn the SSE event stream listener so we can handle interactive permission prompts
+        # (e.g. for sensitive files like .env) even if the user has disabled regular tool-call progress.
+        sse_task = asyncio.create_task(
+            _listen_and_stream_events(
+                update=update,
+                context=context,
+                session_id=session_id,
+                server_url=config.opencode_server_url,
+                is_streaming=bool(is_streaming == 1),
+                status_msg_holder=status_msg_holder
+            )
+        )
+
+        typing_task = asyncio.create_task(
+            _keep_typing(update, config.response_timeout)
+        )
+        before_ids = set()
+        sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
+        sent_message_ids.clear()
+        session_mgr.set_session_running(user_id, True)
+
         # Fetch message IDs before sending the prompt
         try:
             before_messages = await oc_client.list_messages(session_id)
