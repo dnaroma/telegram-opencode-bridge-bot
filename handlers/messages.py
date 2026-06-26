@@ -453,12 +453,11 @@ async def _create_session(oc_client, user_id, session_mgr, config):
     if not session_id:
         raise ValueError(f"OpenCode server response did not contain a session ID: {result}")
 
-    # Fetch user preferred model and mode, falling back to defaults
-    preferred_model = await session_mgr.get_user_preferred_model(user_id, config.opencode_model)
+    session_model = result.get("model") or ""
     preferred_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
 
     await session_mgr.set_active_session(
-        user_id, session_id, preferred_model, work_dir=work_dir, mode=preferred_mode
+        user_id, session_id, session_model, work_dir=work_dir, mode=preferred_mode
     )
     return session_id
 
