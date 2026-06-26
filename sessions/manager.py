@@ -227,11 +227,22 @@ class SessionManager:
         return None
 
     async def set_user_preferred_model(self, user_id: int, model: str) -> None:
-        """Save or update the preferred model for a user in their settings."""
+        """Save or update the preferred model for a user in their settings,
+        preserving the existing work_dir if any."""
+        # Preserve existing work_dir to avoid overwriting it with empty string
+        existing_work_dir = ""
+        async with self._db.execute(
+            "SELECT work_dir FROM user_settings WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                existing_work_dir = row[0]
+
         await self._db.execute(
-            "INSERT INTO user_settings (user_id, work_dir, model) VALUES (?, '', ?) "
+            "INSERT INTO user_settings (user_id, work_dir, model) VALUES (?, ?, ?) "
             "ON CONFLICT(user_id) DO UPDATE SET model = excluded.model",
-            (user_id, model)
+            (user_id, existing_work_dir, model)
         )
         await self._db.commit()
         logger.info(f"Set preferred model for user {user_id}: {model}")
@@ -248,11 +259,22 @@ class SessionManager:
         return default_mode
 
     async def set_user_preferred_mode(self, user_id: int, mode: str) -> None:
-        """Save or update the preferred mode for a user in their settings."""
+        """Save or update the preferred mode for a user in their settings,
+        preserving the existing work_dir if any."""
+        # Preserve existing work_dir to avoid overwriting it with empty string
+        existing_work_dir = ""
+        async with self._db.execute(
+            "SELECT work_dir FROM user_settings WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                existing_work_dir = row[0]
+
         await self._db.execute(
-            "INSERT INTO user_settings (user_id, work_dir, mode) VALUES (?, '', ?) "
+            "INSERT INTO user_settings (user_id, work_dir, mode) VALUES (?, ?, ?) "
             "ON CONFLICT(user_id) DO UPDATE SET mode = excluded.mode",
-            (user_id, mode)
+            (user_id, existing_work_dir, mode)
         )
         await self._db.commit()
         logger.info(f"Set preferred mode for user {user_id}: {mode}")

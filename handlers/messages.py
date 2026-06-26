@@ -230,9 +230,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception as e:
             logger.warning(f"Failed to fetch messages before prompt: {e}")
 
-        session_info = await session_mgr.get_session_info(user_id)
-        session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
-        session_mode = (session_info or {}).get("mode", "build") or "build"
+        # Resolve model and mode: if user hasn't set a model, pass None to let oh-my-openagent plugin decide
+        session_model = await session_mgr.get_effective_model(user_id)
+        session_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
 
         try:
             response_text = await _send_to_opencode(
@@ -248,9 +248,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 logger.warning(f"Session {session_id[:8]}... not found on server (returned null). Creating a new session and retrying...")
                 session_id = await _create_session(oc_client, user_id, session_mgr, config)
                 # Re-fetch model and mode for safe retry
-                session_info = await session_mgr.get_session_info(user_id)
-                session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
-                session_mode = (session_info or {}).get("mode", "build") or "build"
+                # Pass None if user hasn't set a model, letting oh-my-openagent plugin decide
+                session_model = await session_mgr.get_effective_model(user_id)
+                session_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
                 response_text = await _send_to_opencode(
                     oc_client=oc_client,
                     session_id=session_id,
@@ -271,9 +271,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if await ensure_server_running(update, context, user_id):
                 # Server is back up - recreate session and retry message!
                 session_id = await _create_session(oc_client, user_id, session_mgr, config)
-                session_info = await session_mgr.get_session_info(user_id)
-                session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
-                session_mode = (session_info or {}).get("mode", "build") or "build"
+                # Pass None if user hasn't set a model, letting oh-my-openagent plugin decide
+                session_model = await session_mgr.get_effective_model(user_id)
+                session_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
                 
                 response_text = await _send_to_opencode(
                     oc_client=oc_client,
@@ -304,9 +304,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     
                 # Create a brand new session and retry
                 session_id = await _create_session(oc_client, user_id, session_mgr, config)
-                session_info = await session_mgr.get_session_info(user_id)
-                session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
-                session_mode = (session_info or {}).get("mode", "build") or "build"
+                # Pass None if user hasn't set a model, letting oh-my-openagent plugin decide
+                session_model = await session_mgr.get_effective_model(user_id)
+                session_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
                 
                 await update.message.reply_text(
                     "⚠️ <i>Active session was deleted or expired on the server. Starting a fresh session...</i>",
@@ -1154,9 +1154,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         sent_message_ids.clear()
         session_mgr.set_session_running(user_id, True)
         try:
-            session_info = await session_mgr.get_session_info(user_id)
-            session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
-            session_mode = (session_info or {}).get("mode", "build") or "build"
+            # Pass None if user hasn't set a model, letting oh-my-openagent plugin decide
+            session_model = await session_mgr.get_effective_model(user_id)
+            session_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
 
             # Fetch message IDs before sending the prompt
             try:

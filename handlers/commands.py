@@ -1840,12 +1840,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # 2. Switch Model tap
     elif data.startswith("model:"):
         new_model = data[len("model:"):]
-        await session_mgr.set_model(user_id, new_model)
-        await query.edit_message_text(
-            f"✅ Model changed to <code>{html.escape(new_model)}</code>\n\n"
-            f"<i>This applies to your current session.</i>",
-            parse_mode="HTML",
-        )
+        
+        if new_model == "__auto__":
+            await session_mgr.set_model(user_id, "")
+            await query.edit_message_text(
+                f"🔄 Model set to <b>Auto</b>\n\n"
+                f"The model will be determined by the active agent mode.\n\n"
+                f"<i>Each agent (build/plan/pentester) may use a different default model.</i>",
+                parse_mode="HTML",
+            )
+        else:
+            await session_mgr.set_model(user_id, new_model)
+            await query.edit_message_text(
+                f"✅ Model changed to <code>{html.escape(new_model)}</code>\n\n"
+                f"<i>This applies to your current session.</i>",
+                parse_mode="HTML",
+            )
 
     # 2.2.5 Model Variants Selection
     elif data.startswith("modelvariants:"):
@@ -1949,8 +1959,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         }
         emoji = mode_emojis.get(new_mode.lower(), "🤖")
         
+        # Check if user has a locked model
+        locked_model = await session_mgr.get_effective_model(user_id)
+        if locked_model:
+            model_info = f"Using your selected model: <code>{html.escape(locked_model)}</code>"
+        else:
+            model_info = "Using the default model for this agent"
+        
         await query.edit_message_text(
             f"{emoji} Mode changed to <b>{html.escape(new_mode)}</b>\n\n"
+            f"{model_info}\n\n"
             f"<i>OpenCode will now use the '{html.escape(new_mode)}' agent configuration.</i>",
             parse_mode="HTML",
         )
@@ -1991,6 +2009,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             
             sub_keyboard = []
             sub_keyboard.append([InlineKeyboardButton(f"───【 {emoji} {p_name.upper()} MODELS 】───", callback_data="noop")])
+            
+            sub_keyboard.append([InlineKeyboardButton("🔄 Default (Auto) - Let agent decide", callback_data="model:__auto__")])
             
             model_buttons = []
             for m_id, m in models.items():

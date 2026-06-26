@@ -345,7 +345,7 @@ def format_status(
 ) -> str:
     """Format bot status for display."""
     oc_status = "🟢 Connected" if opencode_available else "🔴 Disconnected"
-    model_display = model or "Agent default (server-selected)"
+    model_display = model if model else "Auto (determined by agent)"
     
     lines = [
         "<b>📊 Bot Status</b>",
@@ -357,7 +357,8 @@ def format_status(
     
     if session_info:
         sid = session_info.get('session_id', 'none')[:8]
-        session_model = session_info.get("model") or model_display
+        session_model_raw = session_info.get("model")
+        session_model = session_model_raw if session_model_raw else "Auto (determined by agent)"
         lines.extend([
             "",
             "<b>Current Session:</b>",
