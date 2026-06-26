@@ -903,7 +903,7 @@ async def execute_project_switch(update_or_query, context: ContextTypes.DEFAULT_
                 raise ValueError("Response did not contain a session ID.")
 
             # Fetch user preferred model and mode
-            preferred_model = await session_mgr.get_user_preferred_model(user_id, config.opencode_model)
+            preferred_model = await session_mgr.get_effective_model(user_id) or ""
             preferred_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
             await session_mgr.set_active_session(
                 user_id, session_id, preferred_model, work_dir=target_path, mode=preferred_mode
