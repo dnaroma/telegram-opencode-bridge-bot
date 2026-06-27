@@ -127,9 +127,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 if not oc_client:
                     raise RuntimeError("OpenCode client not available")
                 await oc_client.respond_to_question(
-                    session_id=session_id,
                     question_id=question_id,
-                    answer=message_text
+                    answers=[[message_text]]
                 )
                 
                 pending_questions.pop(short_key, None)
@@ -568,16 +567,23 @@ async def _listen_and_stream_events(
                             if not isinstance(properties, dict):
                                 continue
                             
+                            event_type = payload.get("type", "")
+                            
                             event_session_id = (
                                 properties.get("sessionID")
                                 or properties.get("sessionId")
                                 or properties.get("session_id")
+                                or properties.get("tool", {}).get("sessionID", "") if isinstance(properties.get("tool"), dict) else ""
                                 or payload.get("sessionID")
                                 or payload.get("sessionId")
                                 or payload.get("session_id")
                                 or ""
                             )
-                            if event_session_id != session_id:
+
+                            if event_type in ("question.asked", "permission.asked", "message.part.updated", "message.updated"):
+                                logger.info(f"SSE event: type={event_type} session={event_session_id[:12] if event_session_id else 'NONE'} expected={session_id[:12]} props_keys={list(properties.keys())[:8]}")
+
+                            if event_session_id and event_session_id != session_id:
                                 continue
 
                             event_type = payload.get("type", "")
@@ -588,7 +594,29 @@ async def _listen_and_stream_events(
                                 msg_id = info.get("id")
                                 role = info.get("role")
                                 completed = info.get("time", {}).get("completed")
-                                
+                                error_info = info.get("error") if isinstance(info.get("error"), dict) else None
+
+                                # Message aborted — expire any pending questions from this message
+                                if error_info and error_info.get("name") == "MessageAbortedError":
+                                    pending_questions = context.bot_data.get("pending_questions", {})
+                                    chat_id = update.effective_chat.id if update.effective_chat else None
+                                    expired_keys = [k for k, v in pending_questions.items() if v.get("session_id") == session_id]
+                                    for ek in expired_keys:
+                                        tmsg_id = pending_questions[ek].get("telegram_msg_id")
+                                        if tmsg_id and chat_id:
+                                            try:
+                                                await context.bot.edit_message_text(
+                                                    chat_id=chat_id,
+                                                    message_id=tmsg_id,
+                                                    text="❓ <i>Question expired</i> ⏱️ — the agent timed out waiting for your answer.",
+                                                    parse_mode="HTML"
+                                                )
+                                            except Exception:
+                                                pass
+                                        del pending_questions[ek]
+                                    if expired_keys:
+                                        logger.info(f"Expired {len(expired_keys)} pending questions for aborted message {msg_id}")
+
                                 if role == "assistant" and completed:
                                     sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
                                     if msg_id not in sent_message_ids:
@@ -617,7 +645,6 @@ async def _listen_and_stream_events(
                                                             pass
                                                         status_msg_holder[0] = None
 
-                                                    from utils.formatting import format_opencode_response, split_message
                                                     formatted = format_opencode_response(content_text)
                                                     chunks = split_message(formatted, context.bot_data["config"].max_message_length)
                                                     for i, chunk in enumerate(chunks):
@@ -725,12 +752,14 @@ async def _listen_and_stream_events(
                                     context.bot_data["pending_questions"][short_key] = {
                                         "session_id": session_id,
                                         "question_id": question_id,
+                                        "chat_id": update.effective_chat.id if update.effective_chat else None,
                                     }
 
                                     header_prefix = f"<b>{html.escape(q_header)}</b>\n\n" if q_header else ""
                                     msg = f"❓ {header_prefix}{html.escape(q_text)}"
                                     if q_multiple:
                                         msg += "\n\n<i>You may select multiple options.</i>"
+                                    msg += "\n\n⚠️ <i>Please answer quickly — the question times out after ~30 seconds.</i>"
 
                                     keyboard = []
                                     MAX_Q_OPTIONS = 10
@@ -767,7 +796,7 @@ async def _listen_and_stream_events(
                                         if keyboard:
                                             for chunk in chunks[:-1]:
                                                 await update.message.reply_text(chunk, parse_mode="HTML")
-                                            await update.message.reply_text(
+                                            sent_msg = await update.message.reply_text(
                                                 chunks[-1],
                                                 parse_mode="HTML",
                                                 reply_markup=InlineKeyboardMarkup(keyboard)
@@ -776,6 +805,10 @@ async def _listen_and_stream_events(
                                             for chunk in chunks:
                                                 await update.message.reply_text(chunk, parse_mode="HTML")
                                             context.user_data["awaiting_question_answer"] = short_key
+                                            sent_msg = None
+
+                                        if sent_msg:
+                                            context.bot_data["pending_questions"][short_key]["telegram_msg_id"] = sent_msg.message_id
                                     except Exception as e:
                                         logger.error(f"Failed to send question prompt: {e}")
                                         fallback_msg = f"❓ Question:\n\n{html.escape(q_text)}\n\n<i>Please reply with your answer.</i>"
@@ -806,138 +839,204 @@ async def _listen_and_stream_events(
 
                                     # ── 1. Update In-Place Status Message (Always Active) ──
                                     if status in ("pending", "running") and status_msg_holder and status_msg_holder[0]:
-                                        status_text = ""
-                                        if tool_name == "bash":
-                                            cmd = input_data.get("command") or input_data.get("content") or ""
-                                            cmd_truncated = truncate(cmd, 60)
-                                            status_text = f"💻 <b>Running shell command...</b>\n<code>{html.escape(cmd_truncated)}</code>"
-                                        elif tool_name in ("edit", "write", "save"):
-                                            path = input_data.get("path") or input_data.get("target") or input_data.get("filepath") or ""
-                                            path_truncated = truncate(os.path.basename(path) if path else "", 60)
-                                            status_text = f"📝 <b>Modifying file...</b>\n<code>{html.escape(path_truncated)}</code>"
-                                        elif tool_name in ("read", "view", "show"):
-                                            path = input_data.get("path") or input_data.get("target") or input_data.get("filepath") or ""
-                                            path_truncated = truncate(os.path.basename(path) if path else "", 60)
-                                            status_text = f"🔍 <b>Reading file...</b>\n<code>{html.escape(path_truncated)}</code>"
-                                        elif tool_name in ("webfetch", "websearch", "search"):
-                                            query = input_data.get("query") or input_data.get("url") or ""
-                                            query_truncated = truncate(query, 60)
-                                            status_text = f"🌐 <b>Searching web...</b>\n<code>{html.escape(query_truncated)}</code>"
-                                        elif tool_name == "question":
-                                            status_text = "❓ <b>Waiting for your answer...</b>"
+                                        if status == "pending" and not (isinstance(input_data, dict) and input_data):
+                                            status_text = f"⚙️ <b>Preparing tool <code>{html.escape(tool_name)}</code>...</b>"
                                         else:
-                                            status_text = f"⚙️ <b>Executing tool <code>{html.escape(tool_name)}</code>...</b>"
+                                            status_text = ""
+                                            if tool_name == "bash":
+                                                cmd = input_data.get("command") or input_data.get("content") or ""
+                                                cmd_truncated = truncate(cmd, 60)
+                                                status_text = f"💻 <b>Running shell command...</b>\n<code>{html.escape(cmd_truncated)}</code>"
+                                            elif tool_name in ("edit", "write", "save"):
+                                                path = input_data.get("path") or input_data.get("target") or input_data.get("filePath") or input_data.get("filepath") or ""
+                                                path_truncated = truncate(os.path.basename(path) if path else "", 60)
+                                                status_text = f"📝 <b>Modifying file...</b>\n<code>{html.escape(path_truncated)}</code>"
+                                            elif tool_name in ("read", "view", "show"):
+                                                path = input_data.get("filePath") or input_data.get("path") or input_data.get("target") or input_data.get("filepath") or ""
+                                                path_truncated = truncate(os.path.basename(path) if path else "", 60)
+                                                status_text = f"🔍 <b>Reading file...</b>\n<code>{html.escape(path_truncated)}</code>"
+                                            elif tool_name in ("webfetch", "websearch", "search"):
+                                                query = input_data.get("query") or input_data.get("url") or ""
+                                                query_truncated = truncate(query, 60)
+                                                status_text = f"🌐 <b>Searching web...</b>\n<code>{html.escape(query_truncated)}</code>"
+                                            elif tool_name == "question":
+                                                status_text = "❓ <b>Waiting for your answer...</b>"
+                                            else:
+                                                if isinstance(input_data, dict) and input_data:
+                                                    param_parts = []
+                                                    for k, v in input_data.items():
+                                                        v_str = str(v)
+                                                        if len(v_str) > 80:
+                                                            v_str = v_str[:77] + "..."
+                                                        param_parts.append(f"<code>{html.escape(k)}</code>: {html.escape(v_str)}")
+                                                        if len(param_parts) >= 3:
+                                                            break
+                                                    params_summary = " | ".join(param_parts)
+                                                    status_text = f"⚙️ <b>Executing tool <code>{html.escape(tool_name)}</code>...</b>\n{params_summary}"
+                                                else:
+                                                    status_text = f"⚙️ <b>Executing tool <code>{html.escape(tool_name)}</code>...</b>"
                                         
                                         await update_status(status_text)
 
                                     # ── 1b. Handle Question Tool (Always Active) ──
-                                    if tool_name == "question" and status in ("pending", "running") and call_id not in notified_calls:
-                                        notified_calls.add(call_id)
-                                        completed_calls.add(call_id)
+                                    if tool_name == "question":
+                                        # Question expired / aborted — update Telegram message
+                                        if status == "error" and call_id in completed_calls:
+                                            pending_questions = context.bot_data.get("pending_questions", {})
+                                            expired_keys = [
+                                                k for k, v in pending_questions.items()
+                                                if v.get("call_id") == call_id or v.get("question_id") == call_id
+                                            ]
+                                            chat_id = update.effective_chat.id if update.effective_chat else None
+                                            for ek in expired_keys:
+                                                if ek in pending_questions:
+                                                    tmsg_id = pending_questions[ek].get("telegram_msg_id")
+                                                    if tmsg_id and chat_id:
+                                                        try:
+                                                            await context.bot.edit_message_text(
+                                                                chat_id=chat_id,
+                                                                message_id=tmsg_id,
+                                                                text="❓ <i>Question expired</i> ⏱️ — the agent timed out waiting for your answer.",
+                                                                parse_mode="HTML"
+                                                            )
+                                                        except Exception:
+                                                            pass
+                                                    del pending_questions[ek]
 
-                                        if not isinstance(input_data, dict):
-                                            continue
+                                        # New question — render with buttons
+                                        if status in ("pending", "running") and call_id not in notified_calls:
+                                            notified_calls.add(call_id)
+                                            completed_calls.add(call_id)
 
-                                        questions_list = input_data.get("questions", [])
-                                        if not isinstance(questions_list, list) or not questions_list:
-                                            continue
-
-                                        for q_item in questions_list:
-                                            q_header = q_item.get("header", "")
-                                            q_text = q_item.get("question", "")
-                                            q_options = q_item.get("options", [])
-                                            q_multiple = q_item.get("multiple", False)
-
-                                            if not q_text:
+                                            if not isinstance(input_data, dict):
                                                 continue
 
-                                            if "pending_questions" not in context.bot_data:
-                                                context.bot_data["pending_questions"] = {}
+                                            questions_list = input_data.get("questions", [])
+                                            if not isinstance(questions_list, list) or not questions_list:
+                                                continue
 
-                                            question_key = uuid.uuid4().hex[:8]
-                                            context.bot_data["pending_questions"][question_key] = {
-                                                "session_id": session_id,
-                                                "call_id": call_id,
-                                            }
+                                            for q_item in questions_list:
+                                                q_header = q_item.get("header", "")
+                                                q_text = q_item.get("question", "")
+                                                q_options = q_item.get("options", [])
+                                                q_multiple = q_item.get("multiple", False)
 
-                                            header_prefix = f"<b>{html.escape(q_header)}</b>\n\n" if q_header else ""
-                                            msg = f"❓ {header_prefix}{html.escape(q_text)}"
-                                            if q_multiple:
-                                                msg += "\n\n<i>You may select multiple options.</i>"
+                                                if not q_text:
+                                                    continue
 
-                                            keyboard = []
-                                            MAX_Q_OPTIONS = 10
-                                            display_options = q_options[:MAX_Q_OPTIONS] if isinstance(q_options, list) else []
+                                                if "pending_questions" not in context.bot_data:
+                                                    context.bot_data["pending_questions"] = {}
 
-                                            for idx, opt in enumerate(display_options):
-                                                if isinstance(opt, dict):
-                                                    label = opt.get("label", f"Option {idx+1}")
-                                                    value = opt.get("value", label)
-                                                    desc = opt.get("description", "")
-                                                    display_label = f"{label[:50]}"
-                                                    if desc and len(label) + len(desc) < 55:
-                                                        display_label = f"{label[:30]} — {desc[:20]}"
-                                                    cb_value = value[:40]
-                                                else:
-                                                    display_label = str(opt)[:50]
-                                                    cb_value = display_label
+                                                # Try to find existing question_id from a prior question.asked event
+                                                existing_qid = None
+                                                for v in context.bot_data["pending_questions"].values():
+                                                    if v.get("call_id") == call_id and v.get("question_id"):
+                                                        existing_qid = v["question_id"]
+                                                        break
+
+                                                question_key = uuid.uuid4().hex[:8]
+                                                context.bot_data["pending_questions"][question_key] = {
+                                                    "session_id": session_id,
+                                                    "call_id": call_id,
+                                                    "question_id": existing_qid or call_id,
+                                                    "chat_id": update.effective_chat.id if update.effective_chat else None,
+                                                }
+
+                                                header_prefix = f"<b>{html.escape(q_header)}</b>\n\n" if q_header else ""
+                                                msg = f"❓ {header_prefix}{html.escape(q_text)}"
+                                                if q_multiple:
+                                                    msg += "\n\n<i>You may select multiple options.</i>"
+                                                msg += "\n\n⚠️ <i>Please answer quickly — the question times out after ~30 seconds.</i>"
+
+                                                keyboard = []
+                                                MAX_Q_OPTIONS = 10
+                                                display_options = q_options[:MAX_Q_OPTIONS] if isinstance(q_options, list) else []
+
+                                                for idx, opt in enumerate(display_options):
+                                                    if isinstance(opt, dict):
+                                                        label = opt.get("label", f"Option {idx+1}")
+                                                        value = opt.get("value", label)
+                                                        desc = opt.get("description", "")
+                                                        display_label = f"{label[:50]}"
+                                                        if desc and len(label) + len(desc) < 55:
+                                                            display_label = f"{label[:30]} — {desc[:20]}"
+                                                        cb_value = value[:40]
+                                                    else:
+                                                        display_label = str(opt)[:50]
+                                                        cb_value = display_label
+
+                                                    keyboard.append([InlineKeyboardButton(
+                                                        display_label,
+                                                        callback_data=f"question:{question_key}:{cb_value}"
+                                                    )])
+
+                                                if isinstance(q_options, list) and len(q_options) > MAX_Q_OPTIONS:
+                                                    msg += f"\n\n<i>(Showing {MAX_Q_OPTIONS} of {len(q_options)} options)</i>"
 
                                                 keyboard.append([InlineKeyboardButton(
-                                                    display_label,
-                                                    callback_data=f"question:{question_key}:{cb_value}"
+                                                    "✏️ Type custom answer",
+                                                    callback_data=f"question:{question_key}:__custom__"
                                                 )])
 
-                                            if isinstance(q_options, list) and len(q_options) > MAX_Q_OPTIONS:
-                                                msg += f"\n\n<i>(Showing {MAX_Q_OPTIONS} of {len(q_options)} options)</i>"
-
-                                            keyboard.append([InlineKeyboardButton(
-                                                "✏️ Type custom answer",
-                                                callback_data=f"question:{question_key}:__custom__"
-                                            )])
-
-                                            try:
-                                                chunks = split_message(msg, context.bot_data["config"].max_message_length)
-                                                for chunk in chunks[:-1]:
-                                                    await update.message.reply_text(chunk, parse_mode="HTML")
-                                                await update.message.reply_text(
-                                                    chunks[-1],
-                                                    parse_mode="HTML",
-                                                    reply_markup=InlineKeyboardMarkup(keyboard)
-                                                )
-                                            except Exception as e:
-                                                logger.error(f"Failed to send question prompt: {e}")
                                                 try:
-                                                    fallback = f"❓ {html.escape(q_text)}\n\n<i>Please reply with your answer.</i>"
-                                                    await update.message.reply_text(fallback, parse_mode="HTML")
-                                                    context.user_data["awaiting_question_answer"] = question_key
-                                                except Exception:
-                                                    pass
+                                                    chunks = split_message(msg, context.bot_data["config"].max_message_length)
+                                                    for chunk in chunks[:-1]:
+                                                        await update.message.reply_text(chunk, parse_mode="HTML")
+                                                    sent_msg = await update.message.reply_text(
+                                                        chunks[-1],
+                                                        parse_mode="HTML",
+                                                        reply_markup=InlineKeyboardMarkup(keyboard)
+                                                    )
+                                                    context.bot_data["pending_questions"][question_key]["telegram_msg_id"] = sent_msg.message_id
+                                                except Exception as e:
+                                                    logger.error(f"Failed to send question prompt: {e}")
+                                                    try:
+                                                        fallback = f"❓ {html.escape(q_text)}\n\n<i>Please reply with your answer.</i>"
+                                                        await update.message.reply_text(fallback, parse_mode="HTML")
+                                                        context.user_data["awaiting_question_answer"] = question_key
+                                                    except Exception:
+                                                        pass
 
                                     # ── 2. Stream Full Tool Logs (Only if is_streaming is True) ──
                                     if is_streaming:
                                         # 1. Tool Call Started / Running
                                         if status in ("pending", "running") and call_id not in notified_calls:
-                                            notified_calls.add(call_id)
-                                            
-                                            desc = input_data.get("description", "") if isinstance(input_data, dict) else ""
-                                            desc_text = f" — <i>\"{html.escape(desc)}\"</i>" if desc else ""
-                                            
-                                            msg = f"🛠️ <b>Calling Tool <code>{html.escape(tool_name)}</code></b>{desc_text}\n"
-                                            
-                                            if isinstance(input_data, dict):
-                                                params = {k: v for k, v in input_data.items() if k != "description"}
+                                            if status == "pending" and not (isinstance(input_data, dict) and input_data):
+                                                pass
+                                            else:
+                                                notified_calls.add(call_id)
                                                 
-                                                if params:
-                                                    msg += "\n<b>Parameters:</b>\n"
-                                                    for k, v in params.items():
-                                                        v_str = str(v)
-                                                        if len(v_str) > 100:
-                                                            v_display = f"{v_str[:100]}... ({len(v_str)} chars)"
-                                                        else:
-                                                            v_display = v_str
-                                                        msg += f"  • <code>{html.escape(k)}</code>: {html.escape(v_display)}\n"
+                                                if tool_name == "bash":
+                                                    cmd = input_data.get("command") or input_data.get("content") or ""
+                                                    msg = f"💻 <b>Running shell command...</b>\n<code>{html.escape(truncate(cmd, 60))}</code>"
+                                                elif tool_name in ("edit", "write", "save"):
+                                                    path = input_data.get("path") or input_data.get("target") or input_data.get("filePath") or input_data.get("filepath") or ""
+                                                    msg = f"📝 <b>Modifying file...</b> <code>{html.escape(truncate(os.path.basename(path) if path else '', 60))}</code>"
+                                                elif tool_name in ("read", "view", "show"):
+                                                    path = input_data.get("filePath") or input_data.get("path") or input_data.get("target") or input_data.get("filepath") or ""
+                                                    msg = f"🔍 <b>Reading file...</b> <code>{html.escape(truncate(os.path.basename(path) if path else '', 60))}</code>"
+                                                elif tool_name in ("webfetch", "websearch", "search"):
+                                                    query = input_data.get("query") or input_data.get("url") or ""
+                                                    msg = f"🌐 <b>Searching web...</b> <code>{html.escape(truncate(query, 60))}</code>"
+                                                elif tool_name == "question":
+                                                    msg = "❓ <b>Asking a question...</b>"
+                                                else:
+                                                    msg = f"🛠️ <b>Calling Tool <code>{html.escape(tool_name)}</code></b>"
                                                 
-                                            await update.message.reply_text(msg, parse_mode="HTML")
+                                                if isinstance(input_data, dict):
+                                                    params = {k: v for k, v in input_data.items() if k != "description"}
+                                                    
+                                                    if params:
+                                                        msg += "\n\n<b>Parameters:</b>\n"
+                                                        for k, v in params.items():
+                                                            v_str = str(v)
+                                                            if len(v_str) > 100:
+                                                                v_display = f"{v_str[:100]}... ({len(v_str)} chars)"
+                                                            else:
+                                                                v_display = v_str
+                                                            msg += f"  • <code>{html.escape(k)}</code>: {html.escape(v_display)}\n"
+                                                
+                                                await update.message.reply_text(msg, parse_mode="HTML")
 
                                         # 2. Tool Completed
                                         elif status == "completed" and call_id not in completed_calls:
@@ -981,6 +1080,103 @@ async def _listen_and_stream_events(
         except Exception as e:
             err_name = e or type(e).__name__
             logger.warning(f"Error in SSE streaming task listener: {err_name}. Reconnecting in {retry_delay}s...")
+
+            # Poll for missed question/abort events while SSE was down
+            try:
+                oc_client = context.bot_data["opencode_client"]
+                messages = await oc_client.list_messages(session_id)
+                for msg_data in messages:
+                    info = msg_data.get("info", {}) if isinstance(msg_data, dict) else {}
+                    if not isinstance(info, dict):
+                        continue
+                    msg_error = info.get("error")
+                    if isinstance(msg_error, dict) and msg_error.get("name") == "MessageAbortedError":
+                        # This message was aborted — expire any related pending questions
+                        pending_questions = context.bot_data.get("pending_questions", {})
+                        chat_id = update.effective_chat.id if update.effective_chat else None
+                        expired_keys = [k for k, v in pending_questions.items() if v.get("session_id") == session_id]
+                        for ek in expired_keys:
+                            tmsg_id = pending_questions[ek].get("telegram_msg_id")
+                            if tmsg_id and chat_id:
+                                try:
+                                    await context.bot.edit_message_text(
+                                        chat_id=chat_id,
+                                        message_id=tmsg_id,
+                                        text="❓ <i>Question expired</i> ⏱️ — the agent timed out while SSE was disconnected.",
+                                        parse_mode="HTML"
+                                    )
+                                except Exception:
+                                    pass
+                            del pending_questions[ek]
+
+                    # Check for still-pending question tools that SSE might have missed
+                    parts = msg_data.get("parts", []) if isinstance(msg_data, dict) else []
+                    for part in parts:
+                        if not isinstance(part, dict):
+                            continue
+                        if part.get("type") == "tool" and part.get("tool") == "question":
+                            state = part.get("state", {})
+                            if not isinstance(state, dict):
+                                continue
+                            q_call_id = part.get("callID", "")
+                            q_status = state.get("status", "")
+                            if q_status in ("pending", "running") and q_call_id not in notified_calls:
+                                # Found a pending question that SSE missed — render it
+                                input_data = state.get("input", {})
+                                if isinstance(input_data, dict):
+                                    questions_list = input_data.get("questions", [])
+                                    if isinstance(questions_list, list):
+                                        for q_item in questions_list:
+                                            q_header = q_item.get("header", "")
+                                            q_text = q_item.get("question", "")
+                                            q_options = q_item.get("options", [])
+                                            q_multiple = q_item.get("multiple", False)
+                                            if q_text:
+                                                notified_calls.add(q_call_id)
+                                                completed_calls.add(q_call_id)
+                                                if "pending_questions" not in context.bot_data:
+                                                    context.bot_data["pending_questions"] = {}
+                                                qkey = uuid.uuid4().hex[:8]
+                                                context.bot_data["pending_questions"][qkey] = {
+                                                    "session_id": session_id,
+                                                    "call_id": q_call_id,
+                                                    "question_id": q_call_id,
+                                                    "chat_id": update.effective_chat.id if update.effective_chat else None,
+                                                }
+                                                header_prefix = f"<b>{html.escape(q_header)}</b>\n\n" if q_header else ""
+                                                qmsg = f"❓ {header_prefix}{html.escape(q_text)}"
+                                                if q_multiple:
+                                                    qmsg += "\n\n<i>You may select multiple options.</i>"
+                                                qmsg += "\n\n⚠️ <i>Please answer quickly — the question times out after ~30 seconds.</i>"
+                                                kb = []
+                                                for idx, opt in enumerate(q_options[:10]):
+                                                    if isinstance(opt, dict):
+                                                        lbl = opt.get("label", f"Option {idx+1}")
+                                                        val = opt.get("value", lbl)
+                                                        desc = opt.get("description", "")
+                                                        dl = lbl[:50]
+                                                        if desc and len(lbl) + len(desc) < 55:
+                                                            dl = f"{lbl[:30]} — {desc[:20]}"
+                                                        cbv = val[:40]
+                                                    else:
+                                                        dl = str(opt)[:50]
+                                                        cbv = dl
+                                                    kb.append([InlineKeyboardButton(dl, callback_data=f"question:{qkey}:{cbv}")])
+                                                kb.append([InlineKeyboardButton("✏️ Type custom answer", callback_data=f"question:{qkey}:__custom__")])
+                                                try:
+                                                    chunks = split_message(qmsg, context.bot_data["config"].max_message_length)
+                                                    for chunk in chunks[:-1]:
+                                                        await update.message.reply_text(chunk, parse_mode="HTML")
+                                                    sent_msg = await update.message.reply_text(
+                                                        chunks[-1], parse_mode="HTML",
+                                                        reply_markup=InlineKeyboardMarkup(kb)
+                                                    )
+                                                    context.bot_data["pending_questions"][qkey]["telegram_msg_id"] = sent_msg.message_id
+                                                except Exception as ex:
+                                                    logger.error(f"Failed to render missed question from poll: {ex}")
+            except Exception as poll_err:
+                logger.warning(f"Failed to poll for missed events during SSE reconnect: {poll_err}")
+
             try:
                 await asyncio.sleep(retry_delay)
             except asyncio.CancelledError:

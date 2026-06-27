@@ -512,38 +512,46 @@ class OpenCodeClient:
 
     async def respond_to_question(
         self,
-        session_id: str,
         question_id: str,
-        answer: str,
+        answers: list[list[str]],
     ) -> bool:
-        """Respond to a question asked by the agent in a session.
+        """Respond to a question asked by the agent.
+
+        OpenCode API: POST /question/{requestID}/reply
+        Payload: { answers: [[label1, label2], [label3]] }
+          - Each inner list is the selected labels for ONE question in the request.
+          - For a single-question request with one selected option: [[selected_label]]
+          - session_id is NOT in the URL path — the question ID is globally unique.
 
         Parameters:
-            session_id: The session identifier.
-            question_id: The question identifier.
-            answer: The user's answer to the question.
+            question_id: The question request identifier (e.g. que_f06482ccf001...).
+            answers: List of answer rows. Each row is a list of selected label strings.
 
         Returns:
             True if the server successfully recorded the response, False otherwise.
         """
         payload = {
-            "answer": answer,
+            "answers": answers,
         }
         logger.info(
-            f"Sending question response: session={session_id[:8]}... question={question_id}"
+            f"Sending question response: question={question_id} answers={answers}"
         )
         try:
             result = await self._request(
                 "POST",
-                f"/session/{session_id}/questions/{question_id}",
+                f"/question/{question_id}/reply",
                 json_data=payload,
             )
+            logger.info(
+                f"Question response result: question={question_id} result={result}"
+            )
             if isinstance(result, dict):
-                return result.get("success", True)
+                # API returns boolean true on success
+                return bool(result.get("data", result.get("success", True)))
             return True
         except Exception as e:
             logger.error(
-                f"Failed to respond to question {question_id} in session {session_id}: {e}"
+                f"Failed to respond to question {question_id}: {e}"
             )
             raise
 

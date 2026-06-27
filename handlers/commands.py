@@ -1824,26 +1824,57 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 
             session_id = pending["session_id"]
             question_id = pending["question_id"]
+            chat_id = pending.get("chat_id")
+            telegram_msg_id = pending.get("telegram_msg_id")
             
             try:
+                # answers: [[selected_label]] — one row per question, each row is list of selected labels
                 success = await oc_client.respond_to_question(
-                    session_id=session_id,
                     question_id=question_id,
-                    answer=answer
+                    answers=[[answer]]
                 )
                 
                 pending_questions.pop(short_key, None)
-                
-                await query.edit_message_text(
-                    text=f"{query.message.text}\n\n✅ <b>Answer Submitted:</b> <code>{html.escape(answer)}</code>",
-                    parse_mode="HTML"
-                )
+
+                if telegram_msg_id and chat_id:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=telegram_msg_id,
+                            text=f"{query.message.text}\n\n✅ <b>Answer Submitted:</b> <code>{html.escape(answer)}</code>\n\n<i>Agent is processing your answer...</i>",
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        await query.edit_message_text(
+                            text=f"{query.message.text}\n\n✅ <b>Answer Submitted:</b> <code>{html.escape(answer)}</code>\n\n<i>Agent is processing your answer...</i>",
+                            parse_mode="HTML"
+                        )
+                else:
+                    await query.edit_message_text(
+                        text=f"{query.message.text}\n\n✅ <b>Answer Submitted:</b> <code>{html.escape(answer)}</code>\n\n<i>Agent is processing your answer...</i>",
+                        parse_mode="HTML"
+                    )
             except Exception as e:
                 logger.error(f"Error responding to question {question_id} in callback: {e}", exc_info=True)
-                await query.edit_message_text(
-                    text=f"{query.message.text}\n\n⚠️ <b>Error:</b> Failed to submit answer to OpenCode server: {e}",
-                    parse_mode="HTML"
-                )
+                pending_questions.pop(short_key, None)
+                if telegram_msg_id and chat_id:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=telegram_msg_id,
+                            text=f"{query.message.text}\n\n⚠️ <b>Failed to submit:</b> The question has expired or an error occurred. The agent will retry or adjust its approach.",
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        await query.edit_message_text(
+                            text=f"{query.message.text}\n\n⚠️ <b>Error:</b> Failed to submit answer — the question may have already timed out.",
+                            parse_mode="HTML"
+                        )
+                else:
+                    await query.edit_message_text(
+                        text=f"{query.message.text}\n\n⚠️ <b>Error:</b> Failed to submit answer — the question may have already timed out.",
+                        parse_mode="HTML"
+                    )
 
     # 2. Switch Model tap
     elif data.startswith("model:"):
