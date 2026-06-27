@@ -8,23 +8,26 @@ through here to OpenCode's HTTP API (or subprocess fallback).
 import logging
 import asyncio
 import os
+import time
 import html
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
 
-from utils.formatting import format_opencode_response, split_message, format_error
+from utils.formatting import format_opencode_response, split_message, format_error, format_tool_output, IMPORTANT_TOOLS
 from utils.security import sanitize_input
 from opencode.client import OpenCodeAPIError, OpenCodeConnectionError
 
 logger = logging.getLogger(__name__)
 
 
+_SERVER_CHECK_TTL = 60  # seconds — skip redundant health pings within this window
+
 async def ensure_server_running(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     """Ensure the OpenCode serve process is running in the correct directory.
 
-    Uses an in-memory flag inside bot_data to avoid redundant local HTTP pings.
+    Uses a TTL-cached in-memory flag inside bot_data to avoid redundant local HTTP pings.
     If the server is offline, it dynamically boots it scoped to the correct directory.
 
     Returns True if the server is running, False otherwise.
@@ -34,13 +37,15 @@ async def ensure_server_running(update: Update, context: ContextTypes.DEFAULT_TY
     oc_client = bot_data["opencode_client"]
     session_mgr = bot_data["session_manager"]
 
-    # 1. Check in-memory flag
-    if bot_data.get("server_started"):
+    # 1. Check in-memory flag with TTL cache — skip HTTP ping if recently verified
+    last_check = bot_data.get("server_last_check", 0.0)
+    if bot_data.get("server_started") and (time.monotonic() - last_check) < _SERVER_CHECK_TTL:
         return True
 
-    # 2. If flag is False, check if the server is already reachable (e.g. started externally)
+    # 2. If flag is False or TTL expired, check if the server is already reachable
     if await oc_client.is_available():
         bot_data["server_started"] = True
+        bot_data["server_last_check"] = time.monotonic()
         return True
 
     # 3. Server is offline - lazy launch it scoped to the user's active folder
@@ -87,6 +92,7 @@ async def ensure_server_running(update: Update, context: ContextTypes.DEFAULT_TY
         pass
 
     bot_data["server_started"] = True
+    bot_data["server_last_check"] = time.monotonic()
     return True
 
 
@@ -219,17 +225,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         typing_task = asyncio.create_task(
             _keep_typing(update, config.response_timeout)
         )
-        before_ids = set()
         sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
         sent_message_ids.clear()
         session_mgr.set_session_running(user_id, True)
-
-        # Fetch message IDs before sending the prompt
-        try:
-            before_messages = await oc_client.list_messages(session_id)
-            before_ids = {m.get("info", {}).get("id") for m in before_messages if m.get("info", {}).get("id")}
-        except Exception as e:
-            logger.warning(f"Failed to fetch messages before prompt: {e}")
 
         # Resolve model and mode: if user hasn't set a model, pass None to let oh-my-openagent plugin decide
         session_model = await session_mgr.get_effective_model(user_id)
@@ -369,8 +367,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         after_messages = await oc_client.list_messages(session_id)
         new_messages = [
             m for m in after_messages
-            if m.get("info", {}).get("id") not in before_ids 
-            and m.get("info", {}).get("id") not in sent_message_ids
+            if m.get("info", {}).get("id") not in sent_message_ids
             and m.get("info", {}).get("role") == "assistant"
         ]
         for m in new_messages:
@@ -515,7 +512,6 @@ async def _listen_and_stream_events(
     import json
     import html
     import uuid
-    import time
     import os
 
     url = f"{server_url.rstrip('/')}/global/event"
@@ -997,7 +993,17 @@ async def _listen_and_stream_events(
                                                     except Exception:
                                                         pass
 
-                                    # ── 2. Stream Full Tool Logs (Only if is_streaming is True) ──
+                                    # ── 2. Tool Output Handling ──
+
+                                    # 2a. Always show custom-formatted output for important tools
+                                    if status == "completed" and call_id not in completed_calls:
+                                        if tool_name in IMPORTANT_TOOLS:
+                                            formatted = format_tool_output(tool_name, input_data, output_data)
+                                            if formatted:
+                                                completed_calls.add(call_id)
+                                                await update.message.reply_text(formatted, parse_mode="HTML")
+
+                                    # 2b. Stream Full Tool Logs (Only if is_streaming is True)
                                     if is_streaming:
                                         # 1. Tool Call Started / Running
                                         if status in ("pending", "running") and call_id not in notified_calls:
@@ -1041,19 +1047,23 @@ async def _listen_and_stream_events(
                                         # 2. Tool Completed
                                         elif status == "completed" and call_id not in completed_calls:
                                             completed_calls.add(call_id)
-                                            
-                                            exit_code = metadata.get("exit", 0)
-                                            output_cleaned = truncate(str(output_data))
-                                            
-                                            msg = (
-                                                f"✅ <b>Tool <code>{html.escape(tool_name)}</code> Completed</b> (Exit <code>{exit_code}</code>)\n"
-                                            )
-                                            if output_cleaned.strip():
-                                                msg += f"<pre>{html.escape(output_cleaned)}</pre>"
+
+                                            formatted = format_tool_output(tool_name, input_data, output_data)
+                                            if formatted:
+                                                await update.message.reply_text(formatted, parse_mode="HTML")
                                             else:
-                                                msg += f"<i>(No output returned)</i>"
-                                                
-                                            await update.message.reply_text(msg, parse_mode="HTML")
+                                                exit_code = metadata.get("exit", 0)
+                                                output_cleaned = truncate(str(output_data))
+
+                                                msg = (
+                                                    f"✅ <b>Tool <code>{html.escape(tool_name)}</code> Completed</b> (Exit <code>{exit_code}</code>)\n"
+                                                )
+                                                if output_cleaned.strip():
+                                                    msg += f"<pre>{html.escape(output_cleaned)}</pre>"
+                                                else:
+                                                    msg += f"<i>(No output returned)</i>"
+                                                    
+                                                await update.message.reply_text(msg, parse_mode="HTML")
 
                                         # 3. Tool Failed
                                         elif status in ("failed", "error") and call_id not in completed_calls:
@@ -1330,7 +1340,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     config = bot_data["config"]
 
     import uuid
-    import time
 
     # 1. Extract file metadata
     if document:

@@ -1,12 +1,17 @@
 import html
+import json
 import logging
 import re
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
 # Telegram's hard limit is 4096 chars; use 4000 for safety
 DEFAULT_MAX_LENGTH = 4000
+
+# Tools whose output should always be shown (even with streaming disabled)
+# and that have custom formatters
+IMPORTANT_TOOLS = frozenset({"todowrite"})
 
 
 def format_opencode_response(text: str) -> str:
@@ -371,3 +376,68 @@ def format_status(
         lines.append("\nNo active session. Send a message to start one.")
     
     return "\n".join(lines)
+
+
+_STATUS_EMOJI = {
+    "completed": "✅",
+    "in_progress": "⏳",
+    "pending": "⬜",
+    "cancelled": "❌",
+}
+
+_PRIORITY_EMOJI = {
+    "high": "🔴",
+    "medium": "🟡",
+    "low": "⚪",
+}
+
+
+def _format_todowrite(input_data: dict, output_data) -> Optional[str]:
+    """Format todowrite tool input as a styled Telegram todo list."""
+    todos_raw = input_data.get("todos") if isinstance(input_data, dict) else None
+    if not todos_raw:
+        return None
+
+    if isinstance(todos_raw, str):
+        try:
+            todos_raw = json.loads(todos_raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    if not isinstance(todos_raw, list) or not todos_raw:
+        return None
+
+    lines = ["📋 <b>Todo List</b>\n"]
+    for item in todos_raw:
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get("content", ""))[:200]
+        if not content:
+            continue
+        status = str(item.get("status", "pending")).lower()
+        priority = str(item.get("priority", "medium")).lower()
+        s_emoji = _STATUS_EMOJI.get(status, "⬜")
+        p_emoji = _PRIORITY_EMOJI.get(priority, "🟡")
+        lines.append(f"{s_emoji} {p_emoji} {html.escape(content)}")
+
+    if len(lines) == 1:
+        return None
+
+    return "\n".join(lines)
+
+
+_TOOL_FORMATTERS = {
+    "todowrite": _format_todowrite,
+}
+
+
+def format_tool_output(tool_name: str, input_data, output_data) -> Optional[str]:
+    """Return custom-formatted HTML for a tool, or None to use default formatting."""
+    formatter = _TOOL_FORMATTERS.get(tool_name)
+    if not formatter:
+        return None
+    try:
+        return formatter(input_data, output_data)
+    except Exception:
+        logger.debug(f"Custom formatter for {tool_name} failed, falling back to default")
+        return None
