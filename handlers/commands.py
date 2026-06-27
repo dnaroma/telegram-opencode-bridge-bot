@@ -183,15 +183,65 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         reverse=True,
     )
 
+    # Cache the full session list in user_data so the render helper can paginate
+    context.user_data["sessions_list"] = workspace_sessions
+
     # Lookup locally-tracked data
     refreshed_local = await session_mgr.list_user_sessions(user_id)
     local_map = {ls.get("session_id"): ls for ls in refreshed_local}
     active_sid = await session_mgr.get_active_session(user_id)
 
     folder_name = os.path.basename(current_dir) or "Root"
-    lines = [f"<b>📋 Sessions in {html.escape(folder_name)}</b>\n"]
 
-    for s in workspace_sessions:
+    context.user_data["sessions_page"] = 1
+    await render_sessions_list(
+        update, context, user_id, folder_name,
+        workspace_sessions, local_map, active_sid, page=1,
+    )
+
+
+async def render_sessions_list(
+    update_or_query, context, user_id, folder_name,
+    workspace_sessions, local_map, active_sid, page=None,
+) -> None:
+    """Render the paginated sessions list with inline keyboard navigation."""
+    from utils.formatting import format_session_info
+    import math
+
+    if page is None:
+        page = context.user_data.get("sessions_page", 1)
+    else:
+        context.user_data["sessions_page"] = page
+
+    total_sessions = len(workspace_sessions)
+    page_size = 5
+    total_pages = math.ceil(total_sessions / page_size)
+    if total_pages == 0:
+        total_pages = 1
+
+    # Clamp page
+    if page > total_pages:
+        page = total_pages
+    if page < 1:
+        page = 1
+    context.user_data["sessions_page"] = page
+
+    # Sync the stored list so callbacks can use it
+    context.user_data["sessions_list"] = workspace_sessions
+
+    start_idx = (page - 1) * page_size
+    end_idx = start_idx + page_size
+    page_sessions = workspace_sessions[start_idx:end_idx]
+
+    lines = [
+        f"<b>📋 Sessions in {html.escape(folder_name)}</b>\n",
+        f"🔢 <b>会话总数:</b> <code>{total_sessions}</code>",
+    ]
+    if total_pages > 1:
+        lines.append(f"  (Page {page}/{total_pages})")
+    lines.append("")
+
+    for s in page_sessions:
         s_id = s.get("id", "")
         s_title = s.get("title", "")
         local_info = local_map.get(s_id, {})
@@ -230,6 +280,7 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         if s_title and s_id in local_map:
             try:
+                session_mgr = context.bot_data["session_manager"]
                 await session_mgr._db.execute(
                     "UPDATE sessions SET name = ? WHERE opencode_session_id = ?",
                     (s_title, s_id)
@@ -238,23 +289,43 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             except Exception:
                 pass
 
+    # Build inline keyboard — session switch buttons for this page
     keyboard = []
-    for s in workspace_sessions:
+    for s in page_sessions:
         s_id = s.get("id", "")
         s_title = s.get("title", "") or s_id[:8]
         is_active = (s_id == active_sid)
         marker = "🔹" if is_active else "📄"
-        button_text = f"{marker} {s_title}"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"sess:{s_id}")])
+        keyboard.append([InlineKeyboardButton(f"{marker} {s_title}", callback_data=f"sess:{s_id}")])
+
+    # Pagination controls
+    if total_pages > 1:
+        nav_buttons = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"sess_page:{page - 1}"))
+        else:
+            nav_buttons.append(InlineKeyboardButton("⏹️", callback_data="noop"))
+
+        nav_buttons.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+
+        if page < total_pages:
+            nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"sess_page:{page + 1}"))
+        else:
+            nav_buttons.append(InlineKeyboardButton("⏹️", callback_data="noop"))
+        keyboard.append(nav_buttons)
 
     reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
 
     if keyboard:
-        lines.append("\n👉 <b>Tap a session below to instantly switch to it:</b>")
+        lines.append("👉 <b>Tap a session below to instantly switch to it:</b>")
     else:
-        lines.append("\n<i>Send a message to start a conversation!</i>")
+        lines.append("<i>Send a message to start a conversation!</i>")
 
-    await update.message.reply_text("\n".join(lines), reply_markup=reply_markup, parse_mode="HTML")
+    is_query = hasattr(update_or_query, "edit_message_text")
+    if is_query:
+        await update_or_query.edit_message_text("\n".join(lines), reply_markup=reply_markup, parse_mode="HTML")
+    else:
+        await update_or_query.message.reply_text("\n".join(lines), reply_markup=reply_markup, parse_mode="HTML")
 
 
 # ──────────────────────────────────────────────
@@ -318,16 +389,59 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
     active_sid = await session_mgr.get_active_session(user_id)
-
     folder_name = os.path.basename(current_dir) or "Root"
+
+    context.user_data["delete_sessions_list"] = workspace_sessions
+    context.user_data["delete_sessions_page"] = 1
+    await render_delete_sessions_list(
+        update, context, user_id, folder_name,
+        workspace_sessions, active_sid, page=1,
+    )
+
+
+async def render_delete_sessions_list(
+    update_or_query, context, user_id, folder_name,
+    workspace_sessions, active_sid, page=None,
+) -> None:
+    """Render the paginated delete-sessions list with inline keyboard navigation."""
+    import math
+
+    if page is None:
+        page = context.user_data.get("delete_sessions_page", 1)
+    else:
+        context.user_data["delete_sessions_page"] = page
+
+    total_sessions = len(workspace_sessions)
+    page_size = 5
+    total_pages = math.ceil(total_sessions / page_size)
+    if total_pages == 0:
+        total_pages = 1
+
+    if page > total_pages:
+        page = total_pages
+    if page < 1:
+        page = 1
+    context.user_data["delete_sessions_page"] = page
+
+    context.user_data["delete_sessions_list"] = workspace_sessions
+
+    start_idx = (page - 1) * page_size
+    end_idx = start_idx + page_size
+    page_sessions = workspace_sessions[start_idx:end_idx]
+
     text = (
-        f"🗑️ <b>Delete Session (Workspace: {html.escape(folder_name)})</b>\n\n"
-        f"Choose a session below to permanently delete it from your local machine and the server.\n\n"
-        f"⚠️ <b>WARNING:</b> This cannot be undone!"
+        f"🗑️ <b>Delete Session (Workspace: {html.escape(folder_name)})</b>\n"
+        f"🔢 <b>会话总数:</b> <code>{total_sessions}</code>"
+    )
+    if total_pages > 1:
+        text += f"  (Page {page}/{total_pages})"
+    text += (
+        "\n\nChoose a session below to permanently delete it from your local machine and the server.\n\n"
+        "⚠️ <b>WARNING:</b> This cannot be undone!"
     )
 
     keyboard = []
-    for s in workspace_sessions:
+    for s in page_sessions:
         s_id = s.get("id", "")
         s_title = s.get("title", "") or s_id[:8]
         is_active = (s_id == active_sid)
@@ -335,8 +449,28 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         button_text = f"❌ Delete {s_title} {marker}"
         keyboard.append([InlineKeyboardButton(button_text, callback_data=f"delsess:{s_id}")])
 
+    if total_pages > 1:
+        nav_buttons = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"del_page:{page - 1}"))
+        else:
+            nav_buttons.append(InlineKeyboardButton("⏹️", callback_data="noop"))
+
+        nav_buttons.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+
+        if page < total_pages:
+            nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"del_page:{page + 1}"))
+        else:
+            nav_buttons.append(InlineKeyboardButton("⏹️", callback_data="noop"))
+        keyboard.append(nav_buttons)
+
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
+
+    is_query = hasattr(update_or_query, "edit_message_text")
+    if is_query:
+        await update_or_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
+    else:
+        await update_or_query.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
 
 
 # ──────────────────────────────────────────────
@@ -1601,6 +1735,29 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await render_skills_list(query, context, user_id, current_dir)
         return
 
+    # 0.5 Sessions pagination
+    elif data.startswith("sess_page:"):
+        page = int(data.split(":")[1])
+        workspace_sessions = context.user_data.get("sessions_list", [])
+        if not workspace_sessions:
+            await query.edit_message_text("⚠️ Session list expired. Use /sessions to reload.", parse_mode="HTML")
+            return
+
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        folder_name = os.path.basename(current_dir) or "Root"
+
+        refreshed_local = await session_mgr.list_user_sessions(user_id)
+        local_map = {ls.get("session_id"): ls for ls in refreshed_local}
+        active_sid = await session_mgr.get_active_session(user_id)
+
+        await render_sessions_list(
+            query, context, user_id, folder_name,
+            workspace_sessions, local_map, active_sid, page=page,
+        )
+        return
+
     # 1. Switch Session tap
     if data.startswith("sess:"):
         target_id = data[len("sess:"):]
@@ -1694,6 +1851,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 parse_mode="HTML",
             )
 
+    # 1.25 Delete-sessions list pagination
+    elif data.startswith("del_page:"):
+        page = int(data.split(":")[1])
+        workspace_sessions = context.user_data.get("delete_sessions_list", [])
+        if not workspace_sessions:
+            await query.edit_message_text("⚠️ Session list expired. Use /delete to reload.", parse_mode="HTML")
+            return
+
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        folder_name = os.path.basename(current_dir) or "Root"
+        active_sid = await session_mgr.get_active_session(user_id)
+
+        await render_delete_sessions_list(
+            query, context, user_id, folder_name,
+            workspace_sessions, active_sid, page=page,
+        )
+        return
+
     # 1.3 Delete Session tap
     elif data.startswith("delsess:"):
         target_id = data[len("delsess:"):]
@@ -1745,6 +1922,38 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"🗑️ <b>Deleted:</b> Session <code>{html.escape(resolved_id[:8])}</code> has been permanently removed.",
             parse_mode="HTML",
         )
+
+        # Reload the delete list so the user can continue deleting
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+
+        def _norm(p):
+            if not p:
+                return ""
+            return os.path.normcase(os.path.normpath(os.path.abspath(p)))
+
+        current_dir_norm = _norm(current_dir)
+
+        refreshed_server_sessions = []
+        try:
+            refreshed_server_sessions = await oc_client.list_sessions()
+        except Exception:
+            pass
+
+        refreshed_workspace = []
+        for s in refreshed_server_sessions:
+            if _norm(s.get("directory", "")) == current_dir_norm:
+                refreshed_workspace.append(s)
+        refreshed_workspace.sort(key=lambda s: s.get("time", {}).get("updated", 0), reverse=True)
+
+        if refreshed_workspace:
+            folder_name = os.path.basename(current_dir) or "Root"
+            new_active_sid = await session_mgr.get_active_session(user_id)
+            await render_delete_sessions_list(
+                query, context, user_id, folder_name,
+                refreshed_workspace, new_active_sid, page=1,
+            )
 
     # 1.5 Handle Sensitive Operations / Tool Permissions
     elif data.startswith("perm:"):
@@ -2503,11 +2712,21 @@ async def render_mcps_list(update_or_query, context, user_id, current_dir, page=
             connected_servers = live_status
 
     total_mcps = len(mcp_config)
-    page_size = 6
+    page_size = 5
     total_pages = math.ceil(total_mcps / page_size)
     if total_pages == 0:
         total_pages = 1
-        
+
+    # Aggregate total tool count from live status
+    total_tools = 0
+    for _srv_name, srv_info in connected_servers.items():
+        if isinstance(srv_info, dict):
+            tools_data = srv_info.get("tools", [])
+            if isinstance(tools_data, list):
+                total_tools += len(tools_data)
+            elif isinstance(tools_data, (int, float)):
+                total_tools += int(tools_data)
+
     # Clamp page
     if page > total_pages:
         page = total_pages
@@ -2517,8 +2736,11 @@ async def render_mcps_list(update_or_query, context, user_id, current_dir, page=
 
     lines = [
         "<b>🛠️ Model Context Protocol (MCP) Servers</b>\n",
-        f"📍 <i>Workspace: {html.escape(os.path.basename(current_dir) or 'Root')}</i>\n"
+        f"📍 <i>Workspace: {html.escape(os.path.basename(current_dir) or 'Root')}</i>\n",
     ]
+
+    if total_tools > 0:
+        lines.append(f"🔧 <b>MCP 工具总数:</b> <code>{total_tools}</code>\n")
 
     if not mcp_config:
         lines.append("📭 <i>No MCP servers configured in this workspace yet.</i>\n")
@@ -2537,9 +2759,9 @@ async def render_mcps_list(update_or_query, context, user_id, current_dir, page=
             mcp_type = info.get("type", "local")
 
             status_icon = "🟢" if is_enabled else "🔴"
-            status_text = "Enabled" if is_enabled else "Disabled"
 
             conn_icon = ""
+            srv_tool_count = 0
             if is_enabled:
                 live_info = connected_servers.get(name, {})
                 status = live_info.get("status")
@@ -2550,13 +2772,21 @@ async def render_mcps_list(update_or_query, context, user_id, current_dir, page=
                 
                 if is_connected:
                     conn_icon = " 🔗 (Connected)"
+                    srv_tools_data = live_info.get("tools", [])
+                    if isinstance(srv_tools_data, list):
+                        srv_tool_count = len(srv_tools_data)
+                    elif isinstance(srv_tools_data, (int, float)):
+                        srv_tool_count = int(srv_tools_data)
                 else:
                     conn_icon = " ⚠️ (Disconnected)"
 
             type_display = "💻 Stdio (Local)" if mcp_type == "local" else "🌐 Remote (SSE)"
 
             lines.append(f"{status_icon} <b>{html.escape(name)}</b> {conn_icon}")
-            lines.append(f"   • Type: <code>{type_display}</code>")
+            type_line = f"   • Type: <code>{type_display}</code>"
+            if srv_tool_count > 0:
+                type_line += f"  • Tools: <code>{srv_tool_count}</code>"
+            lines.append(type_line)
             
             if mcp_type == "local":
                 cmd_list = info.get("command", [])
