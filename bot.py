@@ -19,6 +19,7 @@ import logging
 import sys
 import os
 import time
+import subprocess
 
 # Switch to Selector Event Loop on Windows for robust signal handling and clean shutdowns
 if sys.platform == 'win32':
@@ -65,6 +66,7 @@ from handlers.commands import (
     callback_handler,
     mcps_command,
     skills_command,
+    ps_command,
 )
 from handlers.messages import handle_message, handle_document
 
@@ -81,7 +83,8 @@ _lock_file = None
 def acquire_bot_lock():
     """Acquire an exclusive lock file to prevent multiple instances from running concurrently."""
     global _lock_file
-    lock_path = os.path.join(os.path.abspath("."), "bot.lock")
+    lock_dir = os.environ.get("BOT_LOCK_DIR", os.path.abspath("."))
+    lock_path = os.path.join(lock_dir, "bot.lock")
     try:
         _lock_file = open(lock_path, "w")
         if os.name == 'nt':
@@ -234,6 +237,10 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
     async def _skills(update, context):
         await skills_command(update, context)
 
+    @authorized(authorizer, rate_limiter)
+    async def _ps(update, context):
+        await ps_command(update, context)
+
     return {
         "start": _start,
         "help": _help,
@@ -259,6 +266,7 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         "document": _document,
         "mcps": _mcps,
         "skills": _skills,
+        "ps": _ps,
     }
 
 
@@ -327,6 +335,19 @@ async def post_shutdown(application) -> None:
             await asyncio.wait_for(oc_client.close(), timeout=3.0)
         except Exception as e:
             logger.warning(f"Failed to close HTTP client: {e}")
+
+    _stop_cloudflare_tunnel()
+
+    global _lock_file
+    if _lock_file:
+        try:
+            _lock_file.close()
+            lock_dir = os.environ.get("BOT_LOCK_DIR", os.path.abspath("."))
+            lock_path = os.path.join(lock_dir, "bot.lock")
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
+        except Exception:
+            pass
 
     logger.info("Goodbye!")
 
@@ -478,9 +499,9 @@ def _build_application():
     session_mgr = SessionManager(db_path=config.db_path)
 
     request = RetryingHTTPXRequest(
-        connect_timeout=15.0,
-        read_timeout=20.0,
-        write_timeout=20.0,
+        connect_timeout=10.0,
+        read_timeout=8.0,
+        write_timeout=15.0,
         pool_timeout=5.0,
         connection_pool_size=512,
     )
@@ -525,6 +546,7 @@ def _build_application():
     application.add_handler(CommandHandler("id", handlers["id"], block=False))
     application.add_handler(CommandHandler("mcps", handlers["mcps"], block=False))
     application.add_handler(CommandHandler("skills", handlers["skills"], block=False))
+    application.add_handler(CommandHandler("ps", handlers["ps"], block=False))
 
     application.add_handler(CallbackQueryHandler(handlers["callback"], block=False))
 
@@ -545,6 +567,39 @@ def _build_application():
     )
 
     return application
+
+
+_tunnel_process = None
+
+
+def _start_cloudflare_tunnel(token: str) -> bool:
+    global _tunnel_process
+    try:
+        _tunnel_process = subprocess.Popen(
+            ["cloudflared", "tunnel", "run", "--token", token],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        logger.info(f"☁️ Cloudflare Tunnel started (PID {_tunnel_process.pid})")
+        return True
+    except FileNotFoundError:
+        logger.error("❌ cloudflared not found. Install: brew install cloudflared")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Failed to start Cloudflare Tunnel: {e}")
+        return False
+
+
+def _stop_cloudflare_tunnel():
+    global _tunnel_process
+    if _tunnel_process and _tunnel_process.poll() is None:
+        _tunnel_process.terminate()
+        try:
+            _tunnel_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _tunnel_process.kill()
+        logger.info("☁️ Cloudflare Tunnel stopped")
+    _tunnel_process = None
 
 
 MAX_CRASH_RESTARTS = 10
@@ -591,23 +646,27 @@ def main():
     logger.info(f"  Default Model:   {config.opencode_model}")
     logger.info(f"  Work Directory:  {config.opencode_work_dir}")
     logger.info(f"  Authorized Users: {len(config.authorized_users)}")
+    logger.info(f"  Mode: {'Webhook' if config.webhook_mode else 'Long Polling'}")
     logger.info("=" * 50)
 
-    # ── Crash-resilient restart loop ──────────────────────
+    if config.webhook_mode:
+        _run_webhook_mode()
+    else:
+        _run_polling_mode()
+
+
+def _run_polling_mode():
     crash_count = 0
     last_crash_time = 0.0
 
     while True:
         try:
             application = _build_application()
-
             logger.info("Starting bot with long polling...")
             application.run_polling(
                 drop_pending_updates=True,
                 allowed_updates=["message", "callback_query"],
             )
-
-            # If run_polling() returns cleanly (e.g. SIGINT), exit normally
             logger.info("Bot polling stopped cleanly.")
             break
 
@@ -620,30 +679,96 @@ def main():
 
         except Exception as fatal:
             now = time.time()
-            # Reset crash counter if bot was stable for CRASH_RESTART_COOLDOWN seconds
             if (now - last_crash_time) > CRASH_RESTART_COOLDOWN:
                 crash_count = 0
-
             crash_count += 1
             last_crash_time = now
 
             if crash_count > MAX_CRASH_RESTARTS:
                 logger.critical(
-                    "💥 Bot crashed %d times within %ds — giving up to prevent restart loop. "
-                    "Last error: %s",
-                    crash_count, CRASH_RESTART_COOLDOWN, fatal,
-                    exc_info=True,
+                    "💥 Bot crashed %d times within %ds — giving up. Last: %s",
+                    crash_count, CRASH_RESTART_COOLDOWN, fatal, exc_info=True,
                 )
                 sys.exit(1)
 
-            backoff = min(5 * crash_count, 60)  # 5s, 10s, 15s … 60s cap
-            logger.error(
-                "💥 Unhandled crash #%d/%d: %s\n"
-                "Restarting in %ds…",
-                crash_count, MAX_CRASH_RESTARTS, fatal, backoff,
-                exc_info=True,
-            )
+            backoff = min(5 * crash_count, 60)
+            logger.error("💥 Unhandled crash #%d/%d: %s\nRestarting in %ds…", crash_count, MAX_CRASH_RESTARTS, fatal, backoff, exc_info=True)
             time.sleep(backoff)
+
+
+def _resolve_webhook_url() -> str | None:
+    """Return the public webhook base URL (must be set via WEBHOOK_URL env var)."""
+    if config.webhook_url:
+        return config.webhook_url.rstrip("/")
+
+    logger.error(
+        "❌ WEBHOOK_URL is required in webhook mode. "
+        "Set it to the public URL of your Cloudflare Tunnel DNS entry, e.g. https://bot.example.com"
+    )
+    return None
+
+
+def _run_webhook_mode():
+    # Start Cloudflare Tunnel if a token is configured (optional — user may run tunnel separately)
+    if config.cloudflare_tunnel_token:
+        if not _start_cloudflare_tunnel(config.cloudflare_tunnel_token):
+            logger.warning("⚠️ Failed to start Cloudflare Tunnel. Continuing (assume tunnel is already running).")
+
+    webhook_base = _resolve_webhook_url()
+    if not webhook_base:
+        logger.error("❌ Cannot resolve webhook URL. Falling back to polling.")
+        _stop_cloudflare_tunnel()
+        _run_polling_mode()
+        return
+
+    webhook_path = f"/bot/{config.telegram_bot_token}"
+    full_webhook_url = f"{webhook_base}{webhook_path}"
+
+    crash_count = 0
+    last_crash_time = 0.0
+
+    while True:
+        try:
+            application = _build_application()
+            logger.info(f"Starting bot in webhook mode on port {config.webhook_port}…")
+            logger.info(f"  Webhook URL: {full_webhook_url}")
+            application.run_webhook(
+                listen="0.0.0.0",
+                port=config.webhook_port,
+                url_path=webhook_path,
+                webhook_url=full_webhook_url,
+                allowed_updates=["message", "callback_query"],
+                drop_pending_updates=True,
+            )
+            logger.info("Bot webhook stopped cleanly.")
+            break
+
+        except KeyboardInterrupt:
+            logger.info("Received KeyboardInterrupt — shutting down.")
+            break
+
+        except SystemExit:
+            raise
+
+        except Exception as fatal:
+            now = time.time()
+            if (now - last_crash_time) > CRASH_RESTART_COOLDOWN:
+                crash_count = 0
+            crash_count += 1
+            last_crash_time = now
+
+            if crash_count > MAX_CRASH_RESTARTS:
+                logger.critical(
+                    "💥 Bot crashed %d times within %ds — giving up. Last: %s",
+                    crash_count, CRASH_RESTART_COOLDOWN, fatal, exc_info=True,
+                )
+                sys.exit(1)
+
+            backoff = min(5 * crash_count, 60)
+            logger.error("💥 Unhandled crash #%d/%d: %s\nRestarting in %ds…", crash_count, MAX_CRASH_RESTARTS, fatal, backoff, exc_info=True)
+            time.sleep(backoff)
+
+    _stop_cloudflare_tunnel()
 
 
 if __name__ == "__main__":

@@ -70,6 +70,20 @@ class Config:
         default_factory=lambda: int(os.getenv('RESPONSE_TIMEOUT', '300'))
     )
 
+    # Webhook
+    webhook_mode: bool = field(
+        default_factory=lambda: os.getenv('WEBHOOK_MODE', 'false').lower() in ('true', '1', 'yes')
+    )
+    webhook_port: int = field(
+        default_factory=lambda: int(os.getenv('WEBHOOK_PORT', '8080'))
+    )
+    webhook_url: str = field(
+        default_factory=lambda: os.getenv('WEBHOOK_URL', '')
+    )
+    cloudflare_tunnel_token: str = field(
+        default_factory=lambda: os.getenv('CLOUDFLARE_TUNNEL_TOKEN', '')
+    )
+
     # Database
     db_path: str = field(
         default_factory=lambda: os.getenv('DB_PATH', 'sessions.db')
@@ -79,16 +93,16 @@ class Config:
     bot_version: str = "0.1.16"
 
     def validate(self) -> None:
-        """Validate that all required configuration values are present.
-
-        Raises:
-            ValueError: If a required configuration value is missing.
-        """
         if not self.telegram_bot_token:
             raise ValueError('TELEGRAM_BOT_TOKEN is required')
         if not self.authorized_users:
             raise ValueError(
                 'AUTHORIZED_USERS is required (comma-separated Telegram user IDs)'
+            )
+        if self.webhook_mode and not self.webhook_url:
+            raise ValueError(
+                'WEBHOOK_MODE requires WEBHOOK_URL (e.g. https://bot.example.com). '
+                'CLOUDFLARE_TUNNEL_TOKEN is optional for auto-starting the tunnel.'
             )
 
 
