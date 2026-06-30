@@ -8,6 +8,7 @@ is restarted from the new project directory so the AI agent is fully scoped.
 import asyncio
 import logging
 import os
+import signal
 import subprocess
 import platform
 import shutil
@@ -16,6 +17,37 @@ logger = logging.getLogger(__name__)
 
 _server_process: subprocess.Popen | None = None
 _server_port: int = 8080  # Default port is 8080 from .env
+
+
+def _kill_process_tree(pid: int) -> None:
+    """Kill a process and all its descendants (process tree).
+
+    On Unix: sends SIGTERM to the process group, then SIGKILL if needed.
+    On Windows: uses taskkill /T /F for tree kill.
+    """
+    if platform.system() == "Windows":
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                           capture_output=True, timeout=10)
+        except Exception:
+            pass
+        return
+
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        return
+
+    import time
+    time.sleep(1)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
 
 def get_opencode_binary() -> str:
     """Find the opencode binary on the system."""
@@ -105,18 +137,18 @@ async def restart_server(directory: str, port: int = 8080, hostname: str = "127.
 async def stop_server() -> None:
     """Stop the running opencode serve process (if any).
 
-    Only terminates the subprocess that THIS bot started (_server_process).
-    Does NOT scan for stray processes on the port — external opencode serve
-    instances are not ours to kill.
+    Kills the entire process tree (parent + child LSP processes) to prevent
+    orphan language-server processes from lingering after workspace switches.
     """
     global _server_process
 
     if _server_process is not None and _server_process.poll() is None:
-        logger.info(f"Stopping opencode serve (pid={_server_process.pid})")
+        pid = _server_process.pid
+        logger.info(f"Stopping opencode serve (pid={pid}) and its child processes")
         try:
-            _server_process.terminate()
+            _kill_process_tree(pid)
             try:
-                _server_process.wait(timeout=5)
+                _server_process.wait(timeout=8)
             except subprocess.TimeoutExpired:
                 _server_process.kill()
                 _server_process.wait(timeout=3)
