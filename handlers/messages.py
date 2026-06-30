@@ -164,274 +164,339 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not message_text or not message_text.strip():
         return
 
+    # ── Prevent concurrent message processing per user ───────
+    # If a previous prompt is still being processed, queue the new one
+    # instead of running it concurrently (which causes replay bugs).
+    bot_data = context.bot_data
+    session_mgr = bot_data["session_manager"]
+
+    # Per-user message queue to serialize processing
+    user_queue: asyncio.Queue = context.user_data.setdefault("message_queue", asyncio.Queue())
+    is_processing = context.user_data.get("message_processing", False)
+
+    if is_processing:
+        # Enqueue the message and return — the processing loop will pick it up
+        await user_queue.put(message_text)
+        await update.message.reply_text(
+            "📥 <i>Message queued — will be processed after the current task completes.</i>",
+            parse_mode="HTML"
+        )
+        return
+
     status_msg = None
     status_msg_holder = None
     sse_task = None
     typing_task = None
 
-    bot_data = context.bot_data
-    session_mgr = bot_data["session_manager"]
-    oc_client = bot_data["opencode_client"]
+    context.user_data["message_processing"] = True
+
     config = bot_data["config"]
+    oc_client = bot_data["opencode_client"]
 
     try:
-        # ── 1. Ensure OpenCode server is running ────────────────
-        if not await ensure_server_running(update, context, user_id):
-            return
+        # Process the current message, then drain the queue
+        messages_to_process = [message_text]
+        while messages_to_process:
+            current_message = messages_to_process.pop(0)
+
+    # ── 1. Ensure OpenCode server is running ────────────────
+            if not await ensure_server_running(update, context, user_id):
+                continue
 
         # ── 2. Send typing indicator ──────────────────────────
-        await update.message.chat.send_action(ChatAction.TYPING)
+            await update.message.chat.send_action(ChatAction.TYPING)
 
         # ── 3. Get or create session ──────────────────────────
-        session_id = await session_mgr.get_active_session(user_id)
+            session_id = await session_mgr.get_active_session(user_id)
 
-        if not session_id:
-            # Create a new OpenCode session
-            try:
-                session_id = await _create_session(oc_client, user_id, session_mgr, config)
-            except Exception as e:
-                logger.error(f"Failed to create session: {e}", exc_info=True)
-                await update.message.reply_text(
-                    format_error(f"Failed to create session: {e}"),
-                    parse_mode="HTML",
-                )
-                return
+            if not session_id:
+                # Create a new OpenCode session
+                try:
+                    session_id = await _create_session(oc_client, user_id, session_mgr, config)
+                except Exception as e:
+                    logger.error(f"Failed to create session: {e}", exc_info=True)
+                    await update.message.reply_text(
+                        format_error(f"Failed to create session: {e}"),
+                        parse_mode="HTML",
+                    )
+                    continue
 
         # ── 4. Send prompt to OpenCode ────────────────────────
-        # Check if streaming is enabled
-        is_streaming = await session_mgr.get_user_streaming(user_id, 0)
+            # Check if streaming is enabled
+            is_streaming = await session_mgr.get_user_streaming(user_id, 0)
 
-        # Send a premium dynamic phase status message to keep user informed in real-time
-        status_msg = await update.message.reply_text(
-            "🧠 <b>Thinking...</b>\n<i>Analyzing request and preparing a plan...</i>",
-            parse_mode="HTML"
-        )
-
-        status_msg_holder = [status_msg]
-
-        # Always spawn the SSE event stream listener so we can handle interactive permission prompts
-        # (e.g. for sensitive files like .env) even if the user has disabled regular tool-call progress.
-        sse_task = asyncio.create_task(
-            _listen_and_stream_events(
-                update=update,
-                context=context,
-                session_id=session_id,
-                server_url=config.opencode_server_url,
-                is_streaming=bool(is_streaming == 1),
-                status_msg_holder=status_msg_holder
-            )
-        )
-
-        typing_task = asyncio.create_task(
-            _keep_typing(update, config.response_timeout)
-        )
-        sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
-        sent_message_ids.clear()
-        session_mgr.set_session_running(user_id, True)
-
-        # Resolve model and mode: if user hasn't set a model, pass None to let oh-my-openagent plugin decide
-        session_model = await session_mgr.get_effective_model(user_id)
-        session_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
-
-        try:
-            response_text = await _send_to_opencode(
-                oc_client=oc_client,
-                session_id=session_id,
-                prompt=message_text,
-                model=session_model,
-                agent=session_mode,
+            # Send a premium dynamic phase status message to keep user informed in real-time
+            status_msg = await update.message.reply_text(
+                "🧠 <b>Thinking...</b>\n<i>Analyzing request and preparing a plan...</i>",
+                parse_mode="HTML"
             )
 
-            if response_text is None:
-                # Session expired or was deleted/lost on the OpenCode server (e.g. server restart)
-                logger.warning(f"Session {session_id[:8]}... not found on server (returned null). Creating a new session and retrying...")
-                session_id = await _create_session(oc_client, user_id, session_mgr, config)
-                # Re-fetch model and mode for safe retry
-                # Pass None if user hasn't set a model, letting oh-my-openagent plugin decide
-                session_model = await session_mgr.get_effective_model(user_id)
-                session_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
-                response_text = await _send_to_opencode(
-                    oc_client=oc_client,
-                    session_id=session_id,
-                    prompt=message_text,
-                    model=session_model,
-                    agent=session_mode,
-                )
-        except OpenCodeConnectionError as conn_err:
-            # Connection crashed/failed - Reset flag and self-heal!
-            logger.warning(f"Connection lost to OpenCode server: {conn_err}. Attempting to recover...")
-            bot_data["server_started"] = False
-            
-            await update.message.reply_text(
-                "⚠️ <i>Connection to OpenCode server was lost. Attempting to restart server and retry...</i>",
-                parse_mode="HTML",
-            )
-            
-            if await ensure_server_running(update, context, user_id):
-                # Server is back up - recreate session and retry message!
-                session_id = await _create_session(oc_client, user_id, session_mgr, config)
-                # Pass None if user hasn't set a model, letting oh-my-openagent plugin decide
-                session_model = await session_mgr.get_effective_model(user_id)
-                session_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
-                
-                response_text = await _send_to_opencode(
-                    oc_client=oc_client,
-                    session_id=session_id,
-                    prompt=message_text,
-                    model=session_model,
-                    agent=session_mode,
-                )
-            else:
-                raise conn_err
-        except OpenCodeAPIError as e:
-            # Check if the session is missing on the server (404)
-            if e.status == 404:
-                logger.warning(f"Session {session_id[:8]}... not found on server (HTTP 404). Starting a new one...")
-                # Delete the deleted session from DB
-                try:
-                    await session_mgr._db.execute(
-                        "DELETE FROM sessions WHERE user_id = ? AND opencode_session_id = ?",
-                        (user_id, session_id)
-                    )
-                    await session_mgr._db.commit()
-                except Exception:
-                    pass
-                
-                # Clear cache
-                if user_id in session_mgr._active_sessions:
-                    del session_mgr._active_sessions[user_id]
-                    
-                # Create a brand new session and retry
-                session_id = await _create_session(oc_client, user_id, session_mgr, config)
-                # Pass None if user hasn't set a model, letting oh-my-openagent plugin decide
-                session_model = await session_mgr.get_effective_model(user_id)
-                session_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
-                
-                await update.message.reply_text(
-                    "⚠️ <i>Active session was deleted or expired on the server. Starting a fresh session...</i>",
-                    parse_mode="HTML",
-                )
-                
-                # Retry sending
-                response_text = await _send_to_opencode(
-                    oc_client=oc_client,
-                    session_id=session_id,
-                    prompt=message_text,
-                    model=session_model,
-                    agent=session_mode,
-                )
-            else:
-                raise
+            status_msg_holder = [status_msg]
 
-    except asyncio.TimeoutError:
-        await update.message.reply_text(
-            "⏰ <b>Request timed out.</b>\n\n"
-            "OpenCode took too long to respond. Try a simpler prompt or check the server.",
-            parse_mode="HTML",
-        )
-        return
-    except OpenCodeAPIError as e:
-        logger.error(f"OpenCode API error: {e}", exc_info=True)
-        await update.message.reply_text(
-            format_error(str(e)),
-            parse_mode="HTML",
-        )
-        return
-    except Exception as e:
-        logger.error(f"OpenCode error: {e}", exc_info=True)
-        await update.message.reply_text(
-            format_error(str(e)),
-            parse_mode="HTML",
-        )
-        return
-    finally:
-        session_mgr.set_session_running(user_id, False)
-        if typing_task:
-            typing_task.cancel()
-        if sse_task:
-            sse_task.cancel()
-        # Clean up by deleting the temporary live phase status message
-        if status_msg_holder and status_msg_holder[0]:
+            # Always spawn the SSE event stream listener so we can handle interactive permission prompts
+            # (e.g. for sensitive files like .env) even if the user has disabled regular tool-call progress.
+            sse_task = asyncio.create_task(
+                _listen_and_stream_events(
+                    update=update,
+                    context=context,
+                    session_id=session_id,
+                    server_url=config.opencode_server_url,
+                    is_streaming=bool(is_streaming == 1),
+                    status_msg_holder=status_msg_holder
+                )
+            )
+
+            typing_task = asyncio.create_task(
+                _keep_typing(update, config.response_timeout)
+            )
+            # DON'T clear sent_message_ids — this causes concurrent handlers to re-send old messages.
+            # Only ADD to it; stale IDs from previous requests are harmless (they just prevent re-sending).
+            sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
+            session_mgr.set_session_running(user_id, True)
+
+            # Resolve model and mode: if user hasn't set a model, pass None to let oh-my-openagent plugin decide
+            session_model = await session_mgr.get_effective_model(user_id)
+            session_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
+
+            # Snapshot existing message IDs before sending — list_messages() returns
+            # the full session history, so we must diff to avoid replaying old replies.
+            # Include sent_message_ids from previous requests to prevent re-sending.
+            before_msg_ids: set = set(sent_message_ids)
             try:
-                await status_msg_holder[0].delete()
-            except Exception:
-                pass
-
-    # ── 4. Track the message ──────────────────────────────
-    await session_mgr.increment_message_count(user_id, prompt=message_text)
-
-    # ── 5. Format and send response ───────────────────────
-    # Fetch messages after prompt completes to get all multi-step assistant messages
-    response_texts = []
-    try:
-        after_messages = await oc_client.list_messages(session_id)
-        new_messages = [
-            m for m in after_messages
-            if m.get("info", {}).get("id") not in sent_message_ids
-            and m.get("info", {}).get("role") == "assistant"
-        ]
-        for m in new_messages:
-            parts = m.get("parts", [])
-            content_text = ""
-            if isinstance(parts, list):
-                text_parts = [
-                    p.get("text", "")
-                    for p in parts
-                    if isinstance(p, dict) and p.get("type") == "text"
-                ]
-                content_text = "".join(text_parts)
-            if content_text.strip():
-                response_texts.append(content_text)
-    except Exception as e:
-        logger.warning(f"Failed to fetch messages after prompt: {e}")
-
-    # Fallback to standard response if no intermediate texts were retrieved
-    all_responses = response_texts if response_texts else ([response_text] if response_text else [])
-
-    if not all_responses:
-        if response_text == "ABORTED":
-            return
-        # Send a user-friendly status message to prevent getting stuck silently
-        await update.message.reply_text(
-            "ℹ️ <b>OpenCode finished execution.</b>\n<i>(No conversational text response was returned)</i>",
-            parse_mode="HTML"
-        )
-        return
-
-    for resp in all_responses:
-        if not resp or resp == "ABORTED":
-            continue
-
-        # Format OpenCode output for Telegram
-        formatted = format_opencode_response(resp)
-
-        # Split into chunks if too long
-        chunks = split_message(formatted, config.max_message_length)
-
-        for i, chunk in enumerate(chunks):
-            try:
-                await update.message.reply_text(
-                    chunk,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
+                existing_msgs = await oc_client.list_messages(session_id)
+                before_msg_ids.update(
+                    m.get("info", {}).get("id")
+                    for m in existing_msgs
+                    if m.get("info", {}).get("id")
                 )
             except Exception as e:
-                # If HTML parsing fails, try sending as plain text
-                logger.warning(f"HTML parse failed for chunk {i+1}, falling back to plain text: {e}")
-                try:
-                    # Strip HTML tags for plain text fallback
-                    import re
-                    plain = re.sub(r'<[^>]+>', '', chunk)
-                    await update.message.reply_text(
-                        plain,
-                        disable_web_page_preview=True,
-                    )
-                except Exception as e2:
-                    logger.error(f"Failed to send chunk {i+1} even as plain text: {e2}")
+                logger.warning(f"Failed to snapshot pre-prompt message IDs: {e}")
 
-            # Small delay between chunks to respect rate limits
-            if i < len(chunks) - 1:
-                await asyncio.sleep(0.5)
+            try:
+                response_text = await _send_to_opencode(
+                    oc_client=oc_client,
+                    session_id=session_id,
+                    prompt=current_message,
+                    model=session_model,
+                    agent=session_mode,
+                )
+
+                if response_text is None:
+                    logger.warning(f"Session {session_id[:8]}... not found on server (returned null). Creating a new session and retrying...")
+                    session_id = await _create_session(oc_client, user_id, session_mgr, config)
+                    session_model = await session_mgr.get_effective_model(user_id)
+                    session_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
+                    response_text = await _send_to_opencode(
+                        oc_client=oc_client,
+                        session_id=session_id,
+                        prompt=current_message,
+                        model=session_model,
+                        agent=session_mode,
+                    )
+            except OpenCodeConnectionError as conn_err:
+                logger.warning(f"Connection lost to OpenCode server: {conn_err}. Attempting to recover...")
+                bot_data["server_started"] = False
+                
+                await update.message.reply_text(
+                    "⚠️ <i>Connection to OpenCode server was lost. Attempting to restart server and retry...</i>",
+                    parse_mode="HTML",
+                )
+                
+                if await ensure_server_running(update, context, user_id):
+                    session_id = await _create_session(oc_client, user_id, session_mgr, config)
+                    session_model = await session_mgr.get_effective_model(user_id)
+                    session_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
+                    
+                    response_text = await _send_to_opencode(
+                        oc_client=oc_client,
+                        session_id=session_id,
+                        prompt=current_message,
+                        model=session_model,
+                        agent=session_mode,
+                    )
+                else:
+                    raise conn_err
+            except OpenCodeAPIError as e:
+                if e.status == 404:
+                    logger.warning(f"Session {session_id[:8]}... not found on server (HTTP 404). Starting a new one...")
+                    try:
+                        await session_mgr._db.execute(
+                            "DELETE FROM sessions WHERE user_id = ? AND opencode_session_id = ?",
+                            (user_id, session_id)
+                        )
+                        await session_mgr._db.commit()
+                    except Exception:
+                        pass
+                    
+                    if user_id in session_mgr._active_sessions:
+                        del session_mgr._active_sessions[user_id]
+                    
+                    session_id = await _create_session(oc_client, user_id, session_mgr, config)
+                    session_model = await session_mgr.get_effective_model(user_id)
+                    session_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
+                    
+                    await update.message.reply_text(
+                        "⚠️ <i>Active session was deleted or expired on the server. Starting a fresh session...</i>",
+                        parse_mode="HTML",
+                    )
+                    
+                    response_text = await _send_to_opencode(
+                        oc_client=oc_client,
+                        session_id=session_id,
+                        prompt=current_message,
+                        model=session_model,
+                        agent=session_mode,
+                    )
+                else:
+                    raise
+
+            except asyncio.TimeoutError:
+                await update.message.reply_text(
+                    "⏰ <b>Request timed out.</b>\n\n"
+                    "OpenCode took too long to respond. Try a simpler prompt or check the server.",
+                    parse_mode="HTML",
+                )
+                continue
+            except OpenCodeAPIError as e:
+                logger.error(f"OpenCode API error: {e}", exc_info=True)
+                await update.message.reply_text(
+                    format_error(str(e)),
+                    parse_mode="HTML",
+                )
+                continue
+            except Exception as e:
+                logger.error(f"OpenCode error: {e}", exc_info=True)
+                await update.message.reply_text(
+                    format_error(str(e)),
+                    parse_mode="HTML",
+                )
+                continue
+            finally:
+                session_mgr.set_session_running(user_id, False)
+                if typing_task:
+                    typing_task.cancel()
+                if sse_task:
+                    sse_task.cancel()
+                if status_msg_holder and status_msg_holder[0]:
+                    try:
+                        await status_msg_holder[0].delete()
+                    except Exception:
+                        pass
+
+            # Track the message
+            await session_mgr.increment_message_count(user_id, prompt=current_message)
+
+            # Fetch messages after prompt completes to get all multi-step assistant messages
+            response_texts = []
+            try:
+                after_messages = await oc_client.list_messages(session_id)
+                new_messages = [
+                    m for m in after_messages
+                    if m.get("info", {}).get("id") not in before_msg_ids
+                    and m.get("info", {}).get("id") not in sent_message_ids
+                    and m.get("info", {}).get("role") == "assistant"
+                ]
+                for m in new_messages:
+                    parts = m.get("parts", [])
+                    content_text = ""
+                    error_msg = _extract_error_from_message(m)
+                    if isinstance(parts, list):
+                        text_parts = [
+                            p.get("text", "")
+                            for p in parts
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        ]
+                        content_text = "".join(text_parts)
+                    if error_msg:
+                        response_texts.append(f"❌ <b>Error:</b> {html.escape(error_msg)}")
+                    elif content_text.strip():
+                        response_texts.append(content_text)
+            except Exception as e:
+                logger.warning(f"Failed to fetch messages after prompt: {e}")
+
+            all_responses = response_texts if response_texts else ([response_text] if response_text else [])
+
+            if not all_responses:
+                if response_text and response_text.startswith("__ERROR__"):
+                    _, _, err_detail = response_text.partition("__ERROR__")
+                    err_parts = err_detail.split("__", 1)
+                    err_name = err_parts[0] if len(err_parts) > 0 else "Unknown"
+                    err_msg = err_parts[1] if len(err_parts) > 1 else err_detail
+                    await update.message.reply_text(
+                        format_error(f"{err_name}: {err_msg}"),
+                        parse_mode="HTML",
+                    )
+                elif response_text == "ABORTED":
+                    pass
+                else:
+                    await update.message.reply_text(
+                        "ℹ️ <b>OpenCode finished execution.</b>\n<i>(No conversational text response was returned)</i>",
+                        parse_mode="HTML"
+                    )
+                while not user_queue.empty():
+                    try:
+                        messages_to_process.append(user_queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                continue
+
+            for resp in all_responses:
+                if not resp or resp == "ABORTED":
+                    continue
+                if resp.startswith("__ERROR__"):
+                    _, _, err_detail = resp.partition("__ERROR__")
+                    err_parts = err_detail.split("__", 1)
+                    err_name = err_parts[0] if len(err_parts) > 0 else "Unknown"
+                    err_msg = err_parts[1] if len(err_parts) > 1 else err_detail
+                    await update.message.reply_text(
+                        format_error(f"{err_name}: {err_msg}"),
+                        parse_mode="HTML",
+                    )
+                    continue
+
+                formatted = format_opencode_response(resp)
+                chunks = split_message(formatted, config.max_message_length)
+
+                for i, chunk in enumerate(chunks):
+                    try:
+                        await update.message.reply_text(
+                            chunk,
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                        )
+                    except Exception as e:
+                        logger.warning(f"HTML parse failed for chunk {i+1}, falling back to plain text: {e}")
+                        try:
+                            import re
+                            plain = re.sub(r'<[^>]+>', '', chunk)
+                            await update.message.reply_text(
+                                plain,
+                                disable_web_page_preview=True,
+                            )
+                        except Exception as e2:
+                            logger.error(f"Failed to send chunk {i+1} even as plain text: {e2}")
+
+                    if i < len(chunks) - 1:
+                        await asyncio.sleep(0.5)
+
+            # Drain the queue for the next iteration
+            while not user_queue.empty():
+                try:
+                    messages_to_process.append(user_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+    except Exception as outer_e:
+        logger.error(f"Unexpected error in message processing loop: {outer_e}", exc_info=True)
+        try:
+            await update.message.reply_text(
+                format_error(str(outer_e)),
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+    finally:
+        context.user_data["message_processing"] = False
 
 
 async def _create_session(oc_client, user_id, session_mgr, config):
@@ -474,7 +539,27 @@ async def _send_to_opencode(oc_client, session_id, prompt, model, agent):
     response = await oc_client.send_message(session_id, prompt, model=model, agent=agent)
     if response is None:
         return None
+    if response.error_message:
+        logger.warning(f"OpenCode returned error in response: {response.error_name}: {response.error_message}")
+        return f"__ERROR__{response.error_name}__{response.error_message}"
     return response.content
+
+
+def _extract_error_from_message(msg_data: dict) -> str | None:
+    """Extract error info from a message dict returned by list_messages, if present."""
+    info = msg_data.get("info", {})
+    if not isinstance(info, dict):
+        return None
+    error_info = info.get("error")
+    if not isinstance(error_info, dict):
+        return None
+    name = error_info.get("name", "")
+    message = error_info.get("message", "")
+    if name == "MessageAbortedError":
+        return None
+    if name or message:
+        return f"{name}: {message}" if name else message
+    return None
 
 
 async def _keep_typing(update: Update, max_seconds: int = 3600) -> None:
@@ -612,6 +697,23 @@ async def _listen_and_stream_events(
                                         del pending_questions[ek]
                                     if expired_keys:
                                         logger.info(f"Expired {len(expired_keys)} pending questions for aborted message {msg_id}")
+
+                                elif error_info and role == "assistant" and completed:
+                                    error_name = error_info.get("name", "Error")
+                                    error_message = error_info.get("message", str(error_info))
+                                    sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
+                                    if msg_id not in sent_message_ids:
+                                        sent_message_ids.add(msg_id)
+                                        if status_msg_holder and status_msg_holder[0]:
+                                            try:
+                                                await status_msg_holder[0].delete()
+                                            except Exception:
+                                                pass
+                                            status_msg_holder[0] = None
+                                        await update.message.reply_text(
+                                            format_error(f"{error_name}: {error_message}"),
+                                            parse_mode="HTML",
+                                        )
 
                                 if role == "assistant" and completed:
                                     sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
@@ -1509,6 +1611,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 for m in new_messages:
                     parts = m.get("parts", [])
                     content_text = ""
+                    error_msg = _extract_error_from_message(m)
                     if isinstance(parts, list):
                         text_parts = [
                             p.get("text", "")
@@ -1516,7 +1619,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                             if isinstance(p, dict) and p.get("type") == "text"
                         ]
                         content_text = "".join(text_parts)
-                    if content_text.strip():
+                    if error_msg:
+                        response_texts.append(f"❌ <b>Error:</b> {html.escape(error_msg)}")
+                    elif content_text.strip():
                         response_texts.append(content_text)
             except Exception as e:
                 logger.warning(f"Failed to fetch messages after document prompt: {e}")
@@ -1525,23 +1630,39 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             all_responses = response_texts if response_texts else ([response_text] if response_text else [])
 
             if not all_responses:
-                if response_text == "ABORTED":
-                    return
-                # Send a user-friendly status message to prevent getting stuck silently
-                await update.message.reply_text(
-                    "ℹ️ <b>OpenCode finished execution.</b>\n<i>(No conversational text response was returned)</i>",
-                    parse_mode="HTML"
-                )
+                if response_text and response_text.startswith("__ERROR__"):
+                    _, _, err_detail = response_text.partition("__ERROR__")
+                    err_parts = err_detail.split("__", 1)
+                    err_name = err_parts[0] if len(err_parts) > 0 else "Unknown"
+                    err_msg = err_parts[1] if len(err_parts) > 1 else err_detail
+                    await update.message.reply_text(
+                        format_error(f"{err_name}: {err_msg}"),
+                        parse_mode="HTML",
+                    )
+                elif response_text == "ABORTED":
+                    pass
+                else:
+                    await update.message.reply_text(
+                        "ℹ️ <b>OpenCode finished execution.</b>\n<i>(No conversational text response was returned)</i>",
+                        parse_mode="HTML"
+                    )
                 return
 
             for resp in all_responses:
                 if not resp or resp == "ABORTED":
                     continue
+                if resp.startswith("__ERROR__"):
+                    _, _, err_detail = resp.partition("__ERROR__")
+                    err_parts = err_detail.split("__", 1)
+                    err_name = err_parts[0] if len(err_parts) > 0 else "Unknown"
+                    err_msg = err_parts[1] if len(err_parts) > 1 else err_detail
+                    await update.message.reply_text(
+                        format_error(f"{err_name}: {err_msg}"),
+                        parse_mode="HTML",
+                    )
+                    continue
 
-                # Format OpenCode output for Telegram
                 formatted = format_opencode_response(resp)
-
-                # Split into chunks if too long
                 chunks = split_message(formatted, config.max_message_length)
 
                 for i, chunk in enumerate(chunks):

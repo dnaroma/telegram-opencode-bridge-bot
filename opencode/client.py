@@ -54,6 +54,8 @@ class OpenCodeMessage:
     content: str
     session_id: str
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    error_name: str = ""
+    error_message: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +369,6 @@ class OpenCodeClient:
             return None
 
         if isinstance(result, dict):
-            # Check for abort/cancel/interrupt finish reasons
             info = result.get("info", {})
             finish_reason = ""
             if isinstance(info, dict):
@@ -381,6 +382,27 @@ class OpenCodeClient:
                     content="ABORTED",
                     session_id=session_id,
                 )
+
+            # Check for error info embedded in the response
+            if isinstance(info, dict):
+                error_info = info.get("error")
+                if isinstance(error_info, dict):
+                    error_name = error_info.get("name", "")
+                    error_message = error_info.get("message", str(error_info))
+                    if error_name == "MessageAbortedError":
+                        return OpenCodeMessage(
+                            role="assistant",
+                            content="ABORTED",
+                            session_id=session_id,
+                        )
+                    # Propagate non-abort errors (rate limit, auth, model errors, etc.)
+                    return OpenCodeMessage(
+                        role="assistant",
+                        content="",
+                        session_id=session_id,
+                        error_name=error_name,
+                        error_message=error_message,
+                    )
 
             # Extract content from the returned parts list if available
             parts = result.get("parts", [])
