@@ -1329,6 +1329,7 @@ async def set_bot_commands(app) -> None:
         BotCommand("id", "Show your Telegram user ID"),
         BotCommand("mcps", "List configured MCP servers"),
         BotCommand("skills", "List and manage agent skills"),
+        BotCommand("ps", "Inspect OpenCode/LSP processes & kill orphans"),
     ]
     await app.bot.set_my_commands(commands)
     
@@ -1363,6 +1364,54 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     import os
     logger.info(f"Callback query received from user {user_id}: {data}")
+
+    # ── Process Kill Callbacks ──────────────────────────────────────────
+    if data.startswith("ps_kill:"):
+        import asyncio as _asyncio
+        pid_str = data[len("ps_kill:"):]
+        pids_to_kill = []
+        for pid_s in pid_str.split(","):
+            try:
+                pids_to_kill.append(int(pid_s.strip()))
+            except ValueError:
+                pass
+
+        if not pids_to_kill:
+            await query.edit_message_text("⚠️ No valid PIDs to kill.", parse_mode="HTML")
+            return
+
+        killed = []
+        failed = []
+        for pid in pids_to_kill:
+            try:
+                import signal as sig_module
+                os.kill(pid, sig_module.SIGTERM)
+                killed.append(pid)
+            except ProcessLookupError:
+                killed.append(pid)
+            except PermissionError:
+                failed.append((pid, "permission denied"))
+            except OSError as e:
+                failed.append((pid, str(e)))
+
+        await _asyncio.sleep(1)
+
+        # Force-kill any survivors
+        for pid in list(killed):
+            try:
+                os.kill(pid, sig_module.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+        result_lines = []
+        if killed:
+            result_lines.append(f"✅ <b>Killed:</b> PID {', '.join(str(p) for p in killed)}")
+        if failed:
+            for pid, reason in failed:
+                result_lines.append(f"❌ <b>Failed:</b> PID {pid} — {html.escape(reason)}")
+
+        await query.edit_message_text("\n".join(result_lines), parse_mode="HTML")
+        return
 
     # ── MCP Server Configuration Callbacks ──────────────────────────────
     if data.startswith("mcp_toggle:"):
@@ -3142,3 +3191,165 @@ async def restart_opencode_serve(update_or_query, context, user_id, work_dir) ->
     if success:
         context.bot_data["server_started"] = True
     return success
+
+
+async def ps_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List opencode/LSP processes and identify orphans for cleanup."""
+    import subprocess as sp
+    import re
+
+    try:
+        result = sp.run(
+            ["ps", "-eo", "pid,ppid,etime,command"],
+            capture_output=True, text=True, timeout=5,
+        )
+        all_lines = result.stdout.strip().split("\n")
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Failed to list processes: {html.escape(str(e))}",
+            parse_mode="HTML",
+        )
+        return
+
+    def is_opencode_serve(cmd: str) -> bool:
+        return "opencode" in cmd.lower() and "serve" in cmd.lower()
+
+    def is_lsp_related(cmd: str) -> bool:
+        lsp_keywords = [
+            "language-server", "language_server", "lsp-daemon",
+            "yaml-language-server", "bash-language-server",
+            "typescript-language-server", "pyright", "basedpyright",
+            "gopls", "rust-analyzer", "clangd", "lua-language-server",
+            "oh-my-openagent",
+        ]
+        cmd_lower = cmd.lower()
+        return any(kw in cmd_lower for kw in lsp_keywords)
+
+    procs: list[dict] = []
+    for line in all_lines[1:]:
+        parts = line.strip().split(None, 3)
+        if len(parts) < 4:
+            continue
+        pid, ppid, etime, command = int(parts[0]), int(parts[1]), parts[2], parts[3]
+        if is_opencode_serve(command) or is_lsp_related(command):
+            procs.append({
+                "pid": pid, "ppid": ppid, "etime": etime, "command": command,
+                "is_serve": is_opencode_serve(command),
+                "is_lsp": is_lsp_related(command),
+            })
+
+    if not procs:
+        await update.message.reply_text(
+            "📭 <b>No OpenCode/LSP processes found.</b>\n\nAll clean — no running servers or language servers detected.",
+            parse_mode="HTML",
+        )
+        return
+
+    serve_pids = {p["pid"] for p in procs if p["is_serve"]}
+
+    from opencode.server import _server_process
+    tracked_pid = _server_process.pid if _server_process and _server_process.poll() is None else None
+
+    orphans: list[dict] = []
+    active: list[dict] = []
+
+    for p in procs:
+        if p["is_serve"]:
+            if p["pid"] == tracked_pid:
+                active.append({**p, "status": "tracked", "label": "🔹 Active (bot-tracked)"})
+            else:
+                active.append({**p, "status": "wild", "label": "⚠️ Wild (not tracked by bot)"})
+        else:
+            parent_pid = p["ppid"]
+            parent_cmd = ""
+            parent_is_serve = False
+            for pp in procs:
+                if pp["pid"] == parent_pid:
+                    parent_cmd = pp["command"]
+                    parent_is_serve = pp["is_serve"]
+                    break
+
+            parent_alive = False
+            try:
+                os.kill(parent_pid, 0)
+                parent_alive = True
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+            if parent_alive and parent_is_serve:
+                active.append({**p, "status": "child", "label": f"  📎 Child of serve (pid {parent_pid})"})
+            elif parent_alive and not parent_is_serve:
+                # Walk up the tree to find a serve ancestor (handles pnpm wrapper chains)
+                ancestor_is_serve = False
+                check_pid = parent_pid
+                for _ in range(5):
+                    for pp in procs:
+                        if pp["pid"] == check_pid:
+                            if pp["is_serve"]:
+                                ancestor_is_serve = True
+                            check_pid = pp["ppid"]
+                            break
+                    else:
+                        break
+                    if ancestor_is_serve:
+                        break
+
+                if ancestor_is_serve:
+                    active.append({**p, "status": "child", "label": f"  📎 Sub-child of serve tree"})
+                elif "Visual Studio Code" in parent_cmd or "Code Helper" in parent_cmd:
+                    continue  # VSCode manages its own LSP servers
+                else:
+                    orphans.append({**p, "status": "orphan", "label": f"  🔗 Non-serve parent (pid {parent_pid})"})
+            else:
+                orphans.append({**p, "status": "orphan", "label": f"  💀 Orphan (parent pid {parent_pid} dead)"})
+
+    lines = ["<b>🔍 OpenCode Process Inspector</b>\n"]
+
+    if active:
+        lines.append("<b>✅ Active Processes</b>")
+        for p in active:
+            cmd_short = p["command"][:80] + "…" if len(p["command"]) > 80 else p["command"]
+            lines.append(f"{p['label']}")
+            lines.append(f"  <code>PID {p['pid']}</code> · up {p['etime']} · <code>{html.escape(cmd_short)}</code>")
+            lines.append("")
+
+    if orphans:
+        lines.append(f"<b>💀 Orphan Processes ({len(orphans)})</b>")
+        lines.append("<i>These have no living parent opencode-serve and can be safely killed.</i>\n")
+        for p in orphans:
+            cmd_short = p["command"][:80] + "…" if len(p["command"]) > 80 else p["command"]
+            lines.append(f"{p['label']}")
+            lines.append(f"  <code>PID {p['pid']}</code> · up {p['etime']} · <code>{html.escape(cmd_short)}</code>")
+            lines.append("")
+    else:
+        lines.append("<b>✨ No orphan processes found!</b>")
+
+    keyboard = []
+    if orphans:
+        orphan_pids = [str(p["pid"]) for p in orphans]
+        keyboard.append([InlineKeyboardButton(
+            f"🗑️ Kill All {len(orphans)} Orphan(s)",
+            callback_data=f"ps_kill:{','.join(orphan_pids)}",
+        )])
+        for p in orphans:
+            keyboard.append([InlineKeyboardButton(
+                f"❌ Kill PID {p['pid']}",
+                callback_data=f"ps_kill:{p['pid']}",
+            )])
+
+    wild_serves = [p for p in active if p.get("status") == "wild"]
+    if wild_serves:
+        wild_pids = [str(p["pid"]) for p in wild_serves]
+        keyboard.append([InlineKeyboardButton(
+            f"⚠️ Kill {len(wild_serves)} Untracked opencode-serve",
+            callback_data=f"ps_kill:{','.join(wild_pids)}",
+        )])
+
+    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+
+    from utils.formatting import split_message
+    output = "\n".join(lines)
+    chunks = split_message(output, 4000)
+    for i, chunk in enumerate(chunks):
+        markup = reply_markup if i == len(chunks) - 1 else None
+        await update.message.reply_text(chunk, reply_markup=markup, parse_mode="HTML")
