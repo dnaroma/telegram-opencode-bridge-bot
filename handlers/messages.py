@@ -175,8 +175,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     is_processing = context.user_data.get("message_processing", False)
 
     if is_processing:
-        # Enqueue the message and return — the processing loop will pick it up
-        await user_queue.put(message_text)
+        # Enqueue the message WITH its message_id so replies can quote the original
+        await user_queue.put((message_text, update.message.message_id))
         await update.message.reply_text(
             "📥 <i>Message queued — will be processed after the current task completes.</i>",
             parse_mode="HTML"
@@ -195,9 +195,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         # Process the current message, then drain the queue
-        messages_to_process = [message_text]
+        messages_to_process = [(message_text, update.message.message_id)]
         while messages_to_process:
-            current_message = messages_to_process.pop(0)
+            current_message, reply_to_msg_id = messages_to_process.pop(0)
 
     # ── 1. Ensure OpenCode server is running ────────────────
             if not await ensure_server_running(update, context, user_id):
@@ -218,6 +218,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     await update.message.reply_text(
                         format_error(f"Failed to create session: {e}"),
                         parse_mode="HTML",
+                        reply_to_message_id=reply_to_msg_id,
                     )
                     continue
 
@@ -228,7 +229,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             # Send a premium dynamic phase status message to keep user informed in real-time
             status_msg = await update.message.reply_text(
                 "🧠 <b>Thinking...</b>\n<i>Analyzing request and preparing a plan...</i>",
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_to_message_id=reply_to_msg_id,
             )
 
             status_msg_holder = [status_msg]
@@ -242,7 +244,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     session_id=session_id,
                     server_url=config.opencode_server_url,
                     is_streaming=bool(is_streaming == 1),
-                    status_msg_holder=status_msg_holder
+                    status_msg_holder=status_msg_holder,
+                    reply_to_message_id=reply_to_msg_id,
                 )
             )
 
@@ -300,6 +303,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text(
                     "⚠️ <i>Connection to OpenCode server was lost. Attempting to restart server and retry...</i>",
                     parse_mode="HTML",
+                    reply_to_message_id=reply_to_msg_id,
                 )
                 
                 if await ensure_server_running(update, context, user_id):
@@ -338,6 +342,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     await update.message.reply_text(
                         "⚠️ <i>Active session was deleted or expired on the server. Starting a fresh session...</i>",
                         parse_mode="HTML",
+                        reply_to_message_id=reply_to_msg_id,
                     )
                     
                     response_text = await _send_to_opencode(
@@ -355,6 +360,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     "⏰ <b>Request timed out.</b>\n\n"
                     "OpenCode took too long to respond. Try a simpler prompt or check the server.",
                     parse_mode="HTML",
+                    reply_to_message_id=reply_to_msg_id,
                 )
                 continue
             except OpenCodeAPIError as e:
@@ -362,6 +368,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text(
                     format_error(str(e)),
                     parse_mode="HTML",
+                    reply_to_message_id=reply_to_msg_id,
                 )
                 continue
             except Exception as e:
@@ -369,6 +376,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text(
                     format_error(str(e)),
                     parse_mode="HTML",
+                    reply_to_message_id=reply_to_msg_id,
                 )
                 continue
             finally:
@@ -425,13 +433,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     await update.message.reply_text(
                         format_error(f"{err_name}: {err_msg}"),
                         parse_mode="HTML",
+                        reply_to_message_id=reply_to_msg_id,
                     )
                 elif response_text == "ABORTED":
                     pass
                 else:
                     await update.message.reply_text(
                         "ℹ️ <b>OpenCode finished execution.</b>\n<i>(No conversational text response was returned)</i>",
-                        parse_mode="HTML"
+                        parse_mode="HTML",
+                        reply_to_message_id=reply_to_msg_id,
                     )
                 while not user_queue.empty():
                     try:
@@ -451,6 +461,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     await update.message.reply_text(
                         format_error(f"{err_name}: {err_msg}"),
                         parse_mode="HTML",
+                        reply_to_message_id=reply_to_msg_id,
                     )
                     continue
 
@@ -463,6 +474,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                             chunk,
                             parse_mode="HTML",
                             disable_web_page_preview=True,
+                            reply_to_message_id=reply_to_msg_id,
                         )
                     except Exception as e:
                         logger.warning(f"HTML parse failed for chunk {i+1}, falling back to plain text: {e}")
@@ -472,6 +484,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                             await update.message.reply_text(
                                 plain,
                                 disable_web_page_preview=True,
+                                reply_to_message_id=reply_to_msg_id,
                             )
                         except Exception as e2:
                             logger.error(f"Failed to send chunk {i+1} even as plain text: {e2}")
@@ -491,7 +504,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         try:
             await update.message.reply_text(
                 format_error(str(outer_e)),
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_to_message_id=reply_to_msg_id,
             )
         except Exception:
             pass
@@ -588,7 +602,8 @@ async def _listen_and_stream_events(
     session_id: str,
     server_url: str,
     is_streaming: bool,
-    status_msg_holder = None
+    status_msg_holder = None,
+    reply_to_message_id: int | None = None,
 ):
     """Listens to global OpenCode events via SSE and handles tool progress/permission requests.
     Includes an automatic reconnect loop with exponential back-off to prevent getting stuck.
@@ -713,6 +728,7 @@ async def _listen_and_stream_events(
                                         await update.message.reply_text(
                                             format_error(f"{error_name}: {error_message}"),
                                             parse_mode="HTML",
+                                            reply_to_message_id=reply_to_message_id,
                                         )
 
                                 if role == "assistant" and completed:
@@ -750,6 +766,7 @@ async def _listen_and_stream_events(
                                                             chunk,
                                                             parse_mode="HTML",
                                                             disable_web_page_preview=True,
+                                                            reply_to_message_id=reply_to_message_id,
                                                         )
                                                         if i < len(chunks) - 1:
                                                             await asyncio.sleep(0.5)
@@ -1103,7 +1120,7 @@ async def _listen_and_stream_events(
                                             formatted = format_tool_output(tool_name, input_data, output_data)
                                             if formatted:
                                                 completed_calls.add(call_id)
-                                                await update.message.reply_text(formatted, parse_mode="HTML")
+                                                await update.message.reply_text(formatted, parse_mode="HTML", reply_to_message_id=reply_to_message_id)
 
                                     # 2b. Stream Full Tool Logs (Only if is_streaming is True)
                                     if is_streaming:
@@ -1144,7 +1161,7 @@ async def _listen_and_stream_events(
                                                                 v_display = v_str
                                                             msg += f"  • <code>{html.escape(k)}</code>: {html.escape(v_display)}\n"
                                                 
-                                                await update.message.reply_text(msg, parse_mode="HTML")
+                                                await update.message.reply_text(msg, parse_mode="HTML", reply_to_message_id=reply_to_message_id)
 
                                         # 2. Tool Completed
                                         elif status == "completed" and call_id not in completed_calls:
@@ -1152,7 +1169,7 @@ async def _listen_and_stream_events(
 
                                             formatted = format_tool_output(tool_name, input_data, output_data)
                                             if formatted:
-                                                await update.message.reply_text(formatted, parse_mode="HTML")
+                                                await update.message.reply_text(formatted, parse_mode="HTML", reply_to_message_id=reply_to_message_id)
                                             else:
                                                 exit_code = metadata.get("exit", 0)
                                                 output_cleaned = truncate(str(output_data))
@@ -1165,7 +1182,7 @@ async def _listen_and_stream_events(
                                                 else:
                                                     msg += f"<i>(No output returned)</i>"
                                                     
-                                                await update.message.reply_text(msg, parse_mode="HTML")
+                                                await update.message.reply_text(msg, parse_mode="HTML", reply_to_message_id=reply_to_message_id)
 
                                         # 3. Tool Failed
                                         elif status in ("failed", "error") and call_id not in completed_calls:
@@ -1181,7 +1198,7 @@ async def _listen_and_stream_events(
                                             else:
                                                 msg += f"<i>(No error description returned)</i>"
                                                 
-                                            await update.message.reply_text(msg, parse_mode="HTML")
+                                            await update.message.reply_text(msg, parse_mode="HTML", reply_to_message_id=reply_to_message_id)
 
                         except Exception as e:
                             logger.debug(f"Error parsing SSE event in listener: {e}")
@@ -1562,7 +1579,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 session_id=session_id,
                 server_url=config.opencode_server_url,
                 is_streaming=bool(is_streaming == 1),
-                status_msg_holder=status_msg_holder
+                status_msg_holder=status_msg_holder,
+                reply_to_message_id=update.message.message_id,
             )
         )
 
@@ -1638,13 +1656,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     await update.message.reply_text(
                         format_error(f"{err_name}: {err_msg}"),
                         parse_mode="HTML",
+                        reply_to_message_id=update.message.message_id,
                     )
                 elif response_text == "ABORTED":
                     pass
                 else:
                     await update.message.reply_text(
                         "ℹ️ <b>OpenCode finished execution.</b>\n<i>(No conversational text response was returned)</i>",
-                        parse_mode="HTML"
+                        parse_mode="HTML",
+                        reply_to_message_id=update.message.message_id,
                     )
                 return
 
@@ -1659,6 +1679,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     await update.message.reply_text(
                         format_error(f"{err_name}: {err_msg}"),
                         parse_mode="HTML",
+                        reply_to_message_id=update.message.message_id,
                     )
                     continue
 
@@ -1671,6 +1692,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                             chunk,
                             parse_mode="HTML",
                             disable_web_page_preview=True,
+                            reply_to_message_id=update.message.message_id,
                         )
                     except Exception as he:
                         import re
@@ -1678,6 +1700,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         await update.message.reply_text(
                             plain,
                             disable_web_page_preview=True,
+                            reply_to_message_id=update.message.message_id,
                         )
                     if i < len(chunks) - 1:
                         await asyncio.sleep(0.5)
@@ -1686,7 +1709,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             logger.error(f"Error analyzing uploaded file: {e}", exc_info=True)
             await update.message.reply_text(
                 format_error(str(e)),
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_to_message_id=update.message.message_id,
             )
         finally:
             session_mgr.set_session_running(user_id, False)
