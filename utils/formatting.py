@@ -4,6 +4,8 @@ import logging
 import re
 from typing import List, Tuple, Optional
 
+from utils.context_usage import ContextUsageAvailable, ContextUsage
+
 logger = logging.getLogger(__name__)
 
 # Telegram's hard limit is 4096 chars; use 4000 for safety
@@ -347,6 +349,7 @@ def format_status(
     session_info: dict | None,
     model: str | None,
     bot_version: str,
+    context_usage: ContextUsage | None = None,
 ) -> str:
     """Format bot status for display."""
     oc_status = "🟢 Connected" if opencode_available else "🔴 Disconnected"
@@ -372,6 +375,11 @@ def format_status(
             f"  Messages: {session_info.get('message_count', 0)}",
             f"  Model: <code>{html.escape(session_model)}</code>",
         ])
+        if isinstance(context_usage, ContextUsageAvailable):
+            lines.append(
+                f"  Context: <code>{context_usage.current_tokens:,} / {context_usage.max_tokens:,}</code> "
+                f"({context_usage.percentage:.1f}%)"
+            )
     else:
         lines.append("\nNo active session. Send a message to start one.")
     

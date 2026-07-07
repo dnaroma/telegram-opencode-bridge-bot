@@ -86,6 +86,8 @@ telegram-opencode-bot
 | **`/delete`** | — | Prompts an inline keyboard to permanently delete a session. |
 | **`/models`** | — | Lists all models available on the OpenCode server to easily select a default. |
 | **`/mode`** | — | Opens a menu to select agent personas (e.g. Build, Plan, custom testers). |
+| **`/subagents`** | — | Shows child/subagent sessions for the active OpenCode session when the runtime exposes them. |
+| **`/restart_opencode`** | — | Force restarts the bot-managed OpenCode server for the active workspace. |
 | **`/plan`** | — | Quick switch shortcut to Plan Mode (read-only analysis). |
 | **`/build`** | — | Quick switch shortcut to Build Mode (read, write, execute permissions). |
 | **`/enable`** | — | Enables real-time streaming of tool calls, shell executions, and file edits. |
@@ -110,7 +112,7 @@ The following parameters can be defined in your `.env` configuration file:
 | `OPENCODE_WORK_DIR` | *String* | Local parent path containing your projects. | `.` |
 | `PROJECT_SCAN_DEPTH` | *Integer*| Max recursion depth used to search project directories. | `2` |
 | `MAX_MESSAGE_LENGTH` | *Integer*| Maximum character limit before chunking Telegram texts. | `4000` |
-| `RESPONSE_TIMEOUT` | *Integer*| Request timeout in seconds (set `0` to disable timeouts). | `300` |
+| `RESPONSE_TIMEOUT` | *Integer*| Request timeout in seconds; `0` disables the timeout, negative or invalid values use the bounded default. | `300` |
 | `DB_PATH` | *String* | Storage path for the SQLite session manager. | `sessions.db` |
 
 ---

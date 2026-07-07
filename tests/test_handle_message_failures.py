@@ -13,6 +13,7 @@ class _Chat:
 class _Message:
     def __init__(self, text: str) -> None:
         self.text = text
+        self.message_id = 77
         self.chat = _Chat()
         self.reply_text = AsyncMock()
 
@@ -36,6 +37,8 @@ class HandleMessageFailureTests(unittest.IsolatedAsyncioTestCase):
         message = _Message("please help")
         update = SimpleNamespace(
             effective_user=SimpleNamespace(id=42),
+            effective_message=message,
+            effective_chat=SimpleNamespace(id=1001),
             message=message,
         )
         session_manager = Mock()
@@ -61,6 +64,8 @@ class HandleMessageFailureTests(unittest.IsolatedAsyncioTestCase):
         message = _Message("please help")
         update = SimpleNamespace(
             effective_user=SimpleNamespace(id=42),
+            effective_message=message,
+            effective_chat=SimpleNamespace(id=1001),
             message=message,
         )
         session_manager = Mock()

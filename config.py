@@ -7,10 +7,22 @@ and exposes them via a validated dataclass singleton.
 
 import os
 from dataclasses import dataclass, field
-from typing import List
+from typing import Final, List
 from dotenv import load_dotenv
 
 load_dotenv()
+
+DEFAULT_RESPONSE_TIMEOUT_SECONDS: Final[int] = 300
+
+
+def normalize_response_timeout(value: int | str | None) -> int:
+    try:
+        timeout = int(value) if value is not None else DEFAULT_RESPONSE_TIMEOUT_SECONDS
+    except ValueError:
+        return DEFAULT_RESPONSE_TIMEOUT_SECONDS
+    if timeout == 0:
+        return 0
+    return timeout if timeout > 0 else DEFAULT_RESPONSE_TIMEOUT_SECONDS
 
 
 @dataclass
@@ -26,7 +38,7 @@ class Config:
         opencode_model: LLM model identifier used by OpenCode.
         opencode_work_dir: Working directory OpenCode operates in.
         max_message_length: Maximum characters per Telegram message chunk.
-        response_timeout: Seconds to wait for an OpenCode response before timing out.
+        response_timeout: Seconds to wait for an OpenCode response before timing out; 0 disables it.
         db_path: File path for the SQLite session database.
     """
 
@@ -67,7 +79,7 @@ class Config:
         default_factory=lambda: int(os.getenv('MAX_MESSAGE_LENGTH', '4000'))
     )
     response_timeout: int = field(
-        default_factory=lambda: int(os.getenv('RESPONSE_TIMEOUT', '300'))
+        default_factory=lambda: normalize_response_timeout(os.getenv('RESPONSE_TIMEOUT'))
     )
 
     # Webhook

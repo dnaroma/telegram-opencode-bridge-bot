@@ -13,6 +13,8 @@ from telegram import Update, BotCommand, BotCommandScopeAllPrivateChats, BotComm
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
 
+from utils.context_usage import get_context_usage
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,6 +67,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/delete — Permanently delete a session\n"
         "/models — List all available models (tap to change)\n"
         "/mode — Select agent mode (TUI dropdown equivalents)\n"
+        "/subagents — Show active OpenCode subagent sessions\n"
+        "/restart_opencode — Force restart OpenCode server for active workspace\n"
         "/plan — Switch to plan mode (read-only)\n"
         "/build — Switch to build mode (read, write, execute)\n"
         "/share — Share current session (get public URL)\n"
@@ -87,6 +91,9 @@ async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """Clear current session and start fresh."""
     user_id = update.effective_user.id
     session_mgr = context.bot_data["session_manager"]
+
+    from opencode.session_delivery import cancel_session_delivery
+    cancel_session_delivery(context, user_id)
 
     await session_mgr.clear_session(user_id)
 
@@ -136,7 +143,7 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         logger.warning(f"Could not fetch sessions from server: {e}")
         await update.message.reply_text(
             "⚠️ Could not reach the OpenCode server to list sessions.\n"
-            "Make sure <code>opencode serve</code> is running.",
+            "Make sure the bot-managed OpenCode server is running for the active project.",
             parse_mode="HTML",
         )
         return
@@ -363,7 +370,7 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.warning(f"Could not fetch sessions from server during delete call: {e}")
         await update.message.reply_text(
             "⚠️ Could not reach the OpenCode server to list sessions.\n"
-            "Make sure <code>opencode serve</code> is running.",
+            "Make sure the bot-managed OpenCode server is running for the active project.",
             parse_mode="HTML",
         )
         return
@@ -575,6 +582,8 @@ async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     pass
 
     if success:
+        from opencode.session_delivery import cancel_session_delivery
+        cancel_session_delivery(context, user_id)
         await update.message.reply_text(
             f"✅ Switched to session <code>{html.escape(resolved_id[:8])}</code>",
             parse_mode="HTML",
@@ -679,6 +688,72 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
 
 
+async def subagents_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    bot_data = context.bot_data
+    session_mgr = bot_data["session_manager"]
+    session_id = await session_mgr.get_active_session(user_id)
+    if not session_id:
+        await update.message.reply_text(
+            "📭 <b>No active session.</b> Send a message first, then use /subagents.",
+            parse_mode="HTML",
+        )
+        return
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+    oc_client = bot_data.get("opencode_client")
+    child_sessions = []
+    listing_unavailable = False
+    try:
+        child_sessions = await oc_client.list_session_children(session_id)
+        listing_unavailable = not getattr(oc_client, "child_session_listing_available", True)
+    except AttributeError:
+        listing_unavailable = True
+    except Exception as exc:
+        listing_unavailable = True
+        logger.warning("Failed to list child sessions for %s: %s", session_id, exc)
+
+    observer_state = None
+    for state in bot_data.get("session_delivery_states", {}).values():
+        if getattr(state, "session_id", None) == session_id:
+            observer_state = state
+            break
+
+    lines = [
+        "🤖 <b>OpenCode Subagents</b>",
+        "",
+        f"• <b>Parent:</b> <code>{html.escape(session_id[:12])}</code>",
+    ]
+    if observer_state:
+        watched = sorted(getattr(observer_state, "watched_session_ids", set()) - {session_id})
+        lines.append(f"• <b>Watcher:</b> active, aware of <code>{len(watched)}</code> child session(s)")
+    else:
+        lines.append("• <b>Watcher:</b> not active for this session yet")
+
+    if listing_unavailable:
+        lines.extend([
+            "",
+            "⚠️ Child-session listing is unavailable in this OpenCode runtime.",
+            "The bridge can still forward resumed parent messages it observes.",
+        ])
+    elif not child_sessions:
+        lines.extend(["", "📭 No child/subagent sessions are visible for this parent session."])
+    else:
+        lines.append("")
+        for child in child_sessions:
+            if not isinstance(child, dict):
+                continue
+            child_id = str(child.get("id", ""))
+            title = str(child.get("title") or child.get("name") or child_id[:12])
+            agent = str(child.get("agent") or child.get("agentID") or child.get("mode") or "unknown")
+            raw_status = child.get("status", "unknown")
+            status = raw_status.get("type", "unknown") if isinstance(raw_status, dict) else str(raw_status)
+            lines.append(f"• <code>{html.escape(child_id[:12])}</code> {html.escape(title)}")
+            lines.append(f"  Agent: <code>{html.escape(agent)}</code> | Status: <code>{html.escape(status)}</code>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 # ──────────────────────────────────────────────
 # Command: /share
 # ──────────────────────────────────────────────
@@ -732,12 +807,24 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     oc_available = await oc_client.is_available()
     session_info = await session_mgr.get_session_info(user_id)
     effective_model = await session_mgr.get_effective_model(user_id)
+    context_usage = None
+
+    if oc_available and session_info and session_info.get("session_id"):
+        session_id = session_info["session_id"]
+        try:
+            messages = await oc_client.list_messages(session_id)
+            providers_payload = await oc_client.get_available_models()
+            fallback_model = session_info.get("model") or effective_model
+            context_usage = get_context_usage(messages, providers_payload, fallback_model)
+        except Exception as e:
+            logger.error("Failed to fetch context usage for session %s: %s", session_id[:8], e, exc_info=True)
 
     status_text = format_status(
         oc_available,
         session_info,
         effective_model,
         config.bot_version,
+        context_usage,
     )
     await update.message.reply_text(status_text, parse_mode="HTML")
 
@@ -945,6 +1032,9 @@ async def execute_project_switch(update_or_query, context: ContextTypes.DEFAULT_
     session_mgr = context.bot_data["session_manager"]
     oc_client = context.bot_data["opencode_client"]
     config = context.bot_data["config"]
+
+    from opencode.session_delivery import cancel_session_delivery
+    cancel_session_delivery(context, user_id)
 
     # Save to database
     await session_mgr.set_user_work_dir(user_id, target_path)
@@ -1322,6 +1412,8 @@ async def set_bot_commands(app) -> None:
         BotCommand("delete", "Permanently delete a session"),
         BotCommand("models", "List all available models"),
         BotCommand("mode", "Select agent mode (TUI dropdown equivalents)"),
+        BotCommand("subagents", "Show active OpenCode subagents"),
+        BotCommand("restart_opencode", "Restart OpenCode server"),
         BotCommand("plan", "Switch to plan mode (read-only)"),
         BotCommand("build", "Switch to build mode (read, write, execute)"),
         BotCommand("share", "Share current session"),
@@ -1890,6 +1982,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                         pass
 
         if success:
+            from opencode.session_delivery import cancel_session_delivery
+            cancel_session_delivery(context, user_id)
             await query.edit_message_text(
                 f"✅ Switched to session <code>{html.escape(resolved_id[:8])}</code>",
                 parse_mode="HTML",
@@ -1962,6 +2056,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # 3. If active session was deleted, clear active cache and reset
         active_sid = await session_mgr.get_active_session(user_id)
         if active_sid == resolved_id:
+            from opencode.session_delivery import cancel_session_delivery
+            cancel_session_delivery(context, user_id)
             if user_id in session_mgr._active_sessions:
                 del session_mgr._active_sessions[user_id]
             # Try to auto-resolve first remaining session or let the bot create a new one lazily
@@ -2088,6 +2184,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             try:
                 # answers: [[selected_label]] — one row per question, each row is list of selected labels
                 success = await oc_client.respond_to_question(
+                    session_id=session_id,
                     question_id=question_id,
                     answers=[[answer]]
                 )
@@ -3191,6 +3288,41 @@ async def restart_opencode_serve(update_or_query, context, user_id, work_dir) ->
     if success:
         context.bot_data["server_started"] = True
     return success
+
+
+async def restart_opencode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    session_mgr = context.bot_data["session_manager"]
+    config = context.bot_data["config"]
+    base_dir = os.path.abspath(config.opencode_work_dir)
+    current_dir = os.path.abspath(await session_mgr.get_user_work_dir(user_id, base_dir))
+    folder_name = os.path.basename(current_dir) or current_dir
+
+    status_msg = await update.message.reply_text(
+        "🔄 <b>Restarting OpenCode server...</b>\n"
+        f"📍 <i>Workspace: {html.escape(folder_name)}</i>",
+        parse_mode="HTML",
+    )
+
+    success = await restart_opencode_serve(update, context, user_id, current_dir)
+    if success:
+        await status_msg.edit_text(
+            "✅ <b>OpenCode server restarted.</b>\n\n"
+            f"📍 <i>Workspace: {html.escape(folder_name)}</i>\n"
+            f"<code>{html.escape(current_dir)}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    context.bot_data["server_started"] = False
+    await status_msg.edit_text(
+        "❌ <b>Failed to restart OpenCode server.</b>\n\n"
+        f"📍 <i>Workspace: {html.escape(folder_name)}</i>\n"
+        f"<code>{html.escape(current_dir)}</code>\n\n"
+        "The port may already be in use by an unmanaged server, or OpenCode failed to start. "
+        "Check bot logs and <code>/ps</code>.",
+        parse_mode="HTML",
+    )
 
 
 async def ps_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

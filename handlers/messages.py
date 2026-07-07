@@ -17,6 +17,7 @@ from telegram.constants import ChatAction
 
 from utils.formatting import format_opencode_response, split_message, format_error, format_tool_output, IMPORTANT_TOOLS
 from utils.security import sanitize_input
+from config import normalize_response_timeout
 from opencode.client import OpenCodeAPIError, OpenCodeConnectionError
 
 logger = logging.getLogger(__name__)
@@ -37,15 +38,26 @@ async def ensure_server_running(update: Update, context: ContextTypes.DEFAULT_TY
     oc_client = bot_data["opencode_client"]
     session_mgr = bot_data["session_manager"]
 
+    work_dir = await session_mgr.get_user_work_dir(user_id, config.opencode_work_dir)
+
+    from urllib.parse import urlparse
+    try:
+        url_parsed = urlparse(config.opencode_server_url)
+        hostname = url_parsed.hostname or "127.0.0.1"
+        port = url_parsed.port or 8080
+    except Exception:
+        hostname = "127.0.0.1"
+        port = 8080
+
+    from opencode.server import ensure_managed_server, is_managed_server_running
+
     # 1. Check in-memory flag with TTL cache — skip HTTP ping if recently verified
     last_check = bot_data.get("server_last_check", 0.0)
-    if bot_data.get("server_started") and (time.monotonic() - last_check) < _SERVER_CHECK_TTL:
-        return True
-
-    # 2. If flag is False or TTL expired, check if the server is already reachable
-    if await oc_client.is_available():
-        bot_data["server_started"] = True
-        bot_data["server_last_check"] = time.monotonic()
+    if (
+        bot_data.get("server_started")
+        and (time.monotonic() - last_check) < _SERVER_CHECK_TTL
+        and is_managed_server_running(work_dir, port=port, hostname=hostname)
+    ):
         return True
 
     # 3. Server is offline - lazy launch it scoped to the user's active folder
@@ -62,22 +74,9 @@ async def ensure_server_running(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             await update.effective_message.reply_text(text, parse_mode="HTML")
 
-    # Resolve last active directory for this user, falling back to default OPENCODE_WORK_DIR
-    work_dir = await session_mgr.get_user_work_dir(user_id, config.opencode_work_dir)
-
-    from urllib.parse import urlparse
-    try:
-        url_parsed = urlparse(config.opencode_server_url)
-        hostname = url_parsed.hostname or "127.0.0.1"
-        port = url_parsed.port or 8080
-    except Exception:
-        hostname = "127.0.0.1"
-        port = 8080
-
-    from opencode.server import restart_server
     logger.info(f"Lazy launching OpenCode server inside: {work_dir} on port {port}")
 
-    started = await restart_server(work_dir, port=port, hostname=hostname)
+    started = await ensure_managed_server(work_dir, port=port, hostname=hostname)
 
     if not started:
         await update_startup_status(
@@ -133,6 +132,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 if not oc_client:
                     raise RuntimeError("OpenCode client not available")
                 await oc_client.respond_to_question(
+                    session_id=session_id,
                     question_id=question_id,
                     answers=[[message_text]]
                 )
@@ -275,6 +275,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             except Exception as e:
                 logger.warning(f"Failed to snapshot pre-prompt message IDs: {e}")
 
+            sent_message_ids.update(before_msg_ids)
+
+            from opencode.session_delivery import register_session_delivery
+            chat_id = update.effective_chat.id if update.effective_chat else update.message.chat.id
+            register_session_delivery(
+                context,
+                user_id=user_id,
+                chat_id=chat_id,
+                session_id=session_id,
+                reply_to_message_id=reply_to_msg_id,
+                sent_message_ids=sent_message_ids,
+            )
+
             try:
                 response_text = await _send_to_opencode(
                     oc_client=oc_client,
@@ -405,6 +418,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     and m.get("info", {}).get("role") == "assistant"
                 ]
                 for m in new_messages:
+                    msg_id = m.get("info", {}).get("id")
+                    if msg_id in sent_message_ids:
+                        continue
+                    if msg_id:
+                        sent_message_ids.add(msg_id)
                     parts = m.get("parts", [])
                     content_text = ""
                     error_msg = _extract_error_from_message(m)
@@ -582,11 +600,10 @@ async def _keep_typing(update: Update, max_seconds: int = 3600) -> None:
     Telegram typing indicator expires after ~5 seconds, so we
     refresh it every 4 seconds.
     """
-    # If max_seconds is 0 or less, default to 1 hour (3600 seconds)
-    limit = max_seconds if max_seconds and max_seconds > 0 else 3600
+    limit = normalize_response_timeout(max_seconds)
     try:
         elapsed = 0
-        while elapsed < limit:
+        while limit == 0 or elapsed < limit:
             await update.message.chat.send_action(ChatAction.TYPING)
             await asyncio.sleep(4)
             elapsed += 4
@@ -642,7 +659,10 @@ async def _listen_and_stream_events(
     retry_delay = 1.0
     while True:
         try:
-            async with aiohttp.ClientSession(read_bufsize=100 * 1024 * 1024) as sse_session:
+            async with aiohttp.ClientSession(
+                read_bufsize=100 * 1024 * 1024,
+                timeout=aiohttp.ClientTimeout(total=None),
+            ) as sse_session:
                 async with sse_session.get(url, headers={"Accept": "text/event-stream"}) as resp:
                     # Connection successful, reset retry delay
                     retry_delay = 1.0
@@ -664,19 +684,28 @@ async def _listen_and_stream_events(
                                 continue
                             
                             event_type = payload.get("type", "")
+                            tool_properties = properties.get("tool", {})
+                            tool_session_id = ""
+                            if isinstance(tool_properties, dict):
+                                tool_session_id = (
+                                    tool_properties.get("sessionID")
+                                    or tool_properties.get("sessionId")
+                                    or tool_properties.get("session_id")
+                                    or ""
+                                )
                             
                             event_session_id = (
                                 properties.get("sessionID")
                                 or properties.get("sessionId")
                                 or properties.get("session_id")
-                                or properties.get("tool", {}).get("sessionID", "") if isinstance(properties.get("tool"), dict) else ""
+                                or tool_session_id
                                 or payload.get("sessionID")
                                 or payload.get("sessionId")
                                 or payload.get("session_id")
                                 or ""
                             )
 
-                            if event_type in ("question.asked", "permission.asked", "message.part.updated", "message.updated"):
+                            if event_type in ("question.asked", "permission.asked", "permission.updated", "message.part.updated", "message.updated"):
                                 logger.info(f"SSE event: type={event_type} session={event_session_id[:12] if event_session_id else 'NONE'} expected={session_id[:12]} props_keys={list(properties.keys())[:8]}")
 
                             if event_session_id and event_session_id != session_id:
@@ -785,10 +814,16 @@ async def _listen_and_stream_events(
                                             logger.warning(f"Failed to stream intermediate message {msg_id}: {e}")
 
                             # B. Handle Permission Requested Popup (Always Enabled)
-                            elif event_type == "permission.asked":
+                            elif event_type in ("permission.asked", "permission.updated"):
                                 perm_id = properties.get("id") or properties.get("permissionID") or payload.get("id")
                                 perm_type = properties.get("permission") or properties.get("type") or "execute"
                                 patterns = properties.get("patterns", [])
+                                if not patterns:
+                                    pattern = properties.get("pattern")
+                                    if isinstance(pattern, list):
+                                        patterns = pattern
+                                    elif pattern:
+                                        patterns = [pattern]
 
                                 if not perm_id:
                                     logger.warning("Received permission.asked event but no permission ID was found.")
@@ -813,6 +848,8 @@ async def _listen_and_stream_events(
                                 tool_info = properties.get("tool", {})
                                 if isinstance(tool_info, dict):
                                     tool_name = tool_info.get("name", "")
+                                if not tool_name:
+                                    tool_name = properties.get("title", "")
                                 if not tool_name:
                                     tool_name = perm_type
 
@@ -1207,7 +1244,7 @@ async def _listen_and_stream_events(
             logger.debug("SSE streaming task listener cancelled by parent task.")
             break
         except Exception as e:
-            err_name = e or type(e).__name__
+            err_name = str(e) or type(e).__name__
             logger.warning(f"Error in SSE streaming task listener: {err_name}. Reconnecting in {retry_delay}s...")
 
             # Poll for missed question/abort events while SSE was down
@@ -1590,7 +1627,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         before_ids = set()
         sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
-        sent_message_ids.clear()
         session_mgr.set_session_running(user_id, True)
         try:
             # Pass None if user hasn't set a model, letting oh-my-openagent plugin decide
@@ -1603,6 +1639,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 before_ids = {m.get("info", {}).get("id") for m in before_messages if m.get("info", {}).get("id")}
             except Exception as e:
                 logger.warning(f"Failed to fetch messages before document prompt: {e}")
+
+            sent_message_ids.update(before_ids)
+
+            from opencode.session_delivery import register_session_delivery
+            chat_id = update.effective_chat.id if update.effective_chat else update.message.chat.id
+            register_session_delivery(
+                context,
+                user_id=user_id,
+                chat_id=chat_id,
+                session_id=session_id,
+                reply_to_message_id=update.message.message_id,
+                sent_message_ids=sent_message_ids,
+            )
 
             response_text = await _send_to_opencode(
                 oc_client=oc_client,
@@ -1627,6 +1676,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     and m.get("info", {}).get("role") == "assistant"
                 ]
                 for m in new_messages:
+                    msg_id = m.get("info", {}).get("id")
+                    if msg_id in sent_message_ids:
+                        continue
+                    if msg_id:
+                        sent_message_ids.add(msg_id)
                     parts = m.get("parts", [])
                     content_text = ""
                     error_msg = _extract_error_from_message(m)

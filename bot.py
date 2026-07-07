@@ -51,6 +51,8 @@ from handlers.commands import (
     plan_command,
     build_command,
     mode_command,
+    subagents_command,
+    restart_opencode_command,
     share_command,
     status_command,
     id_command,
@@ -174,6 +176,14 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         await mode_command(update, context)
 
     @authorized(authorizer, rate_limiter)
+    async def _subagents(update, context):
+        await subagents_command(update, context)
+
+    @authorized(authorizer, rate_limiter)
+    async def _restart_opencode(update, context):
+        await restart_opencode_command(update, context)
+
+    @authorized(authorizer, rate_limiter)
     async def _share(update, context):
         await share_command(update, context)
 
@@ -258,6 +268,8 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         "plan": _plan,
         "build": _build,
         "mode": _mode,
+        "subagents": _subagents,
+        "restart_opencode": _restart_opencode,
         "share": _share,
         "status": _status,
         "id": _id,
@@ -312,6 +324,12 @@ async def post_init(application) -> None:
 async def post_shutdown(application) -> None:
     """Clean up resources on shutdown."""
     logger.info("Shutting down...")
+
+    try:
+        from opencode.session_delivery import cancel_all_session_deliveries
+        await asyncio.wait_for(cancel_all_session_deliveries(application.bot_data), timeout=3.0)
+    except Exception as e:
+        logger.warning(f"Failed to stop session delivery watchers: {e}")
 
     # Stop the background opencode server process if running
     try:
@@ -466,7 +484,7 @@ OPENCODE_WORK_DIR="{work_dir}"
 
 # Limits
 MAX_MESSAGE_LENGTH=4000
-RESPONSE_TIMEOUT=0  # Set to 0 to disable request timeouts entirely
+RESPONSE_TIMEOUT=300
 
 # Database
 DB_PATH=sessions.db
@@ -539,6 +557,8 @@ def _build_application():
     application.add_handler(CommandHandler("disable", handlers["disable"], block=False))
     application.add_handler(CommandHandler("history", handlers["history"], block=False))
     application.add_handler(CommandHandler("mode", handlers["mode"], block=False))
+    application.add_handler(CommandHandler("subagents", handlers["subagents"], block=False))
+    application.add_handler(CommandHandler("restart_opencode", handlers["restart_opencode"], block=False))
     application.add_handler(CommandHandler("plan", handlers["plan"], block=False))
     application.add_handler(CommandHandler("build", handlers["build"], block=False))
     application.add_handler(CommandHandler("share", handlers["share"], block=False))

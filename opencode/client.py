@@ -30,6 +30,8 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 
+from config import normalize_response_timeout
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -106,9 +108,10 @@ class OpenCodeClient:
         max_retries: int = 3,
     ) -> None:
         self.server_url: str = server_url.rstrip("/")
-        # Set total to None to disable the timeout in aiohttp if timeout is 0 or None
-        total_timeout = timeout if timeout and timeout > 0 else None
-        self.timeout: aiohttp.ClientTimeout = aiohttp.ClientTimeout(total=total_timeout)
+        total_timeout = normalize_response_timeout(timeout)
+        self.timeout: aiohttp.ClientTimeout = aiohttp.ClientTimeout(
+            total=None if total_timeout == 0 else total_timeout
+        )
         self.max_retries: int = max_retries
         self._session: Optional[aiohttp.ClientSession] = None
 
@@ -116,6 +119,7 @@ class OpenCodeClient:
         self._auth: Optional[aiohttp.BasicAuth] = None
         if username and password:
             self._auth = aiohttp.BasicAuth(username, password)
+        self.child_session_listing_available = True
 
     # -- async context-manager support --------------------------------------
 
@@ -469,6 +473,26 @@ class OpenCodeClient:
             return result.get("agents", result.get("data", []))
         return []
 
+    async def list_session_children(self, session_id: str) -> List[Dict[str, Any]]:
+        """List child sessions for a parent OpenCode session when supported."""
+        try:
+            result = await self._request("GET", f"/session/{session_id}/children")
+        except OpenCodeAPIError as exc:
+            if exc.status == 404:
+                self.child_session_listing_available = False
+                logger.warning("OpenCode child-session endpoint is unavailable: %s", exc)
+                return []
+            raise
+        self.child_session_listing_available = True
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            for key in ("children", "sessions", "data"):
+                value = result.get(key)
+                if isinstance(value, list):
+                    return value
+        return []
+
     async def abort_session(self, session_id: str) -> bool:
         """Send an abort signal to stop active model processing in a session."""
         try:
@@ -511,8 +535,7 @@ class OpenCodeClient:
             normalized = "reject"
 
         payload = {
-            "response": normalized,
-            "remember": remember,
+            "reply": normalized,
         }
         logger.info(
             f"Sending permission response: session={session_id[:8]}... perm={permission_id} action={normalized}"
@@ -520,7 +543,7 @@ class OpenCodeClient:
         try:
             result = await self._request(
                 "POST",
-                f"/session/{session_id}/permissions/{permission_id}",
+                f"/api/session/{session_id}/permission/{permission_id}/reply",
                 json_data=payload,
             )
             if isinstance(result, dict):
@@ -534,18 +557,19 @@ class OpenCodeClient:
 
     async def respond_to_question(
         self,
+        session_id: str,
         question_id: str,
         answers: list[list[str]],
     ) -> bool:
         """Respond to a question asked by the agent.
 
-        OpenCode API: POST /question/{requestID}/reply
+        OpenCode API: POST /api/session/{sessionID}/question/{requestID}/reply
         Payload: { answers: [[label1, label2], [label3]] }
           - Each inner list is the selected labels for ONE question in the request.
           - For a single-question request with one selected option: [[selected_label]]
-          - session_id is NOT in the URL path — the question ID is globally unique.
 
         Parameters:
+            session_id: The session identifier.
             question_id: The question request identifier (e.g. que_f06482ccf001...).
             answers: List of answer rows. Each row is a list of selected label strings.
 
@@ -556,12 +580,12 @@ class OpenCodeClient:
             "answers": answers,
         }
         logger.info(
-            f"Sending question response: question={question_id} answers={answers}"
+            f"Sending question response: session={session_id[:8]}... question={question_id} answers={answers}"
         )
         try:
             result = await self._request(
                 "POST",
-                f"/question/{question_id}/reply",
+                f"/api/session/{session_id}/question/{question_id}/reply",
                 json_data=payload,
             )
             logger.info(
@@ -594,5 +618,3 @@ class OpenCodeClient:
         if isinstance(result, dict):
             return result
         return {}
-
-

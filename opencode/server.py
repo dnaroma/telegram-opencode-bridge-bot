@@ -12,11 +12,66 @@ import signal
 import subprocess
 import platform
 import shutil
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
 _server_process: subprocess.Popen | None = None
 _server_port: int = 8080  # Default port is 8080 from .env
+_server_identity: "ManagedServerIdentity | None" = None
+_lifecycle_lock = asyncio.Lock()
+
+
+@dataclass(frozen=True)
+class ManagedServerIdentity:
+    directory: str
+    port: int
+    hostname: str
+
+
+def _server_identity_for(directory: str, port: int, hostname: str) -> ManagedServerIdentity:
+    return ManagedServerIdentity(
+        directory=os.path.abspath(directory),
+        port=port,
+        hostname=hostname,
+    )
+
+
+def is_managed_server_running(directory: str, port: int = 8080, hostname: str = "127.0.0.1") -> bool:
+    expected = _server_identity_for(directory, port, hostname)
+    return (
+        _server_identity == expected
+        and _server_process is not None
+        and _server_process.poll() is None
+    )
+
+
+async def _endpoint_is_reachable(hostname: str, port: int) -> bool:
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://{hostname}:{port}/session", timeout=aiohttp.ClientTimeout(total=1)) as resp:
+                return resp.status < 500
+    except Exception:
+        return False
+
+
+async def _wait_for_ready(hostname: str, port: int) -> bool:
+    return await _endpoint_is_reachable(hostname, port)
+
+
+async def ensure_managed_server(
+    directory: str,
+    port: int = 8080,
+    hostname: str = "127.0.0.1",
+    *,
+    verify_reachable: bool = True,
+) -> bool:
+    async with _lifecycle_lock:
+        if is_managed_server_running(directory, port=port, hostname=hostname):
+            if not verify_reachable or await _endpoint_is_reachable(hostname, port):
+                return True
+        return await _restart_server_unlocked(directory, port=port, hostname=hostname)
 
 
 def _kill_process_tree(pid: int) -> None:
@@ -65,12 +120,21 @@ async def restart_server(directory: str, port: int = 8080, hostname: str = "127.
 
     Returns True if the server came up successfully, False otherwise.
     """
-    global _server_process, _server_port
-    _server_port = port
+    async with _lifecycle_lock:
+        return await _restart_server_unlocked(directory, port=port, hostname=hostname)
 
-    # 1. Stop the existing server
-    await stop_server()
+
+async def _restart_server_unlocked(directory: str, port: int = 8080, hostname: str = "127.0.0.1") -> bool:
+    global _server_process, _server_port, _server_identity
+    _server_port = port
+    _server_identity = None
+
+    await _stop_server_unlocked()
     await asyncio.sleep(1)
+
+    if await _endpoint_is_reachable(hostname, port):
+        logger.error("Refusing to reuse unmanaged opencode server already reachable on %s:%d", hostname, port)
+        return False
 
     binary = get_opencode_binary()
     cmd = [binary, "serve", "--port", str(port), "--hostname", hostname]
@@ -98,8 +162,6 @@ async def restart_server(directory: str, port: int = 8080, hostname: str = "127.
             await asyncio.sleep(2)
             continue
 
-        # 3. Wait until the server is reachable (max 15 attempts, 1s sleep + 1s timeout)
-        import aiohttp
         for attempt in range(15):
             # Check if the process exited prematurely
             poll_code = _server_process.poll()
@@ -108,23 +170,27 @@ async def restart_server(directory: str, port: int = 8080, hostname: str = "127.
                 break
 
             await asyncio.sleep(1)
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(f"http://{hostname}:{port}/session", timeout=aiohttp.ClientTimeout(total=1)) as resp:
-                        if resp.status < 500:
-                            logger.info(f"opencode serve is up after {attempt + 1}s (pid={_server_process.pid})")
-                            return True
-            except Exception:
-                pass
+            if await _wait_for_ready(hostname, port) and _server_process.poll() is None:
+                await asyncio.sleep(0.2)
+                if _server_process.poll() is not None:
+                    logger.warning("opencode serve exited during readiness check on attempt %d", run_attempt)
+                    break
+                _server_identity = _server_identity_for(directory, port, hostname)
+                logger.info(f"opencode serve is up after {attempt + 1}s (pid={_server_process.pid})")
+                return True
 
         # Cleanup failed process
         if _server_process:
             try:
-                _server_process.terminate()
+                _kill_process_tree(_server_process.pid)
                 _server_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                _server_process.kill()
+                _server_process.wait(timeout=3)
             except Exception:
                 pass
             _server_process = None
+            _server_identity = None
 
         if run_attempt == 1:
             logger.warning("First startup attempt failed or port was busy. Retrying in 2 seconds...")
@@ -140,7 +206,12 @@ async def stop_server() -> None:
     Kills the entire process tree (parent + child LSP processes) to prevent
     orphan language-server processes from lingering after workspace switches.
     """
-    global _server_process
+    async with _lifecycle_lock:
+        await _stop_server_unlocked()
+
+
+async def _stop_server_unlocked() -> None:
+    global _server_process, _server_identity
 
     if _server_process is not None and _server_process.poll() is None:
         pid = _server_process.pid
@@ -155,3 +226,4 @@ async def stop_server() -> None:
         except Exception as e:
             logger.warning(f"Error stopping opencode serve: {e}")
         _server_process = None
+    _server_identity = None
