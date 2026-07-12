@@ -75,6 +75,10 @@ class SessionManager:
             await self._db.execute("ALTER TABLE user_settings ADD COLUMN mode TEXT DEFAULT ''")
         except aiosqlite.OperationalError:
             pass
+        try:
+            await self._db.execute("ALTER TABLE user_settings ADD COLUMN variant TEXT DEFAULT ''")
+        except aiosqlite.OperationalError:
+            pass
             
         await self._db.execute("""  
             CREATE INDEX IF NOT EXISTS idx_user_active 
@@ -187,7 +191,7 @@ class SessionManager:
             )
             await self._db.commit()
     
-    async def set_model(self, user_id: int, model: str) -> None:
+    async def set_model(self, user_id: int, model: str, variant: Optional[str] = None) -> None:
         """Set the model for a user's active session and also save as preferred settings."""
         # 1. Save in user_settings
         await self.set_user_preferred_model(user_id, model)
@@ -200,6 +204,40 @@ class SessionManager:
                 (model, user_id)
             )
             await self._db.commit()
+
+        # Selecting a normal model or Auto explicitly clears a stale variant.
+        await self.set_variant(user_id, variant)
+
+    async def set_variant(self, user_id: int, variant: Optional[str]) -> None:
+        """Persist the variant with the user settings, including clearing it."""
+        if not hasattr(self, "_variant_by_user"):
+            self._variant_by_user = {}
+        value = str(variant).strip() if variant else None
+        if value:
+            self._variant_by_user[user_id] = value
+        else:
+            self._variant_by_user.pop(user_id, None)
+        if self._db is not None:
+            await self._db.execute(
+                "INSERT INTO user_settings (user_id, work_dir, variant) VALUES (?, '', ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET variant = excluded.variant",
+                (user_id, value or ""),
+            )
+            await self._db.commit()
+
+    async def get_variant(self, user_id: int) -> Optional[str]:
+        cached = getattr(self, "_variant_by_user", {}).get(user_id)
+        if cached:
+            return cached
+        if self._db is not None:
+            if not hasattr(self, "_variant_by_user"):
+                self._variant_by_user = {}
+            async with self._db.execute("SELECT variant FROM user_settings WHERE user_id = ?", (user_id,)) as cursor:
+                row = await cursor.fetchone()
+                if row and row[0]:
+                    self._variant_by_user[user_id] = row[0]
+                    return row[0]
+        return None
 
     async def get_user_preferred_model(self, user_id: int, default_model: str) -> str:
         """Get the preferred model for a specific user, falling back to default."""

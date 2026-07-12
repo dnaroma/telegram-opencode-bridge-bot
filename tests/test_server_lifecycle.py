@@ -177,7 +177,8 @@ class ServerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch("opencode.server.subprocess.Popen", return_value=process):
-            with patch.dict(sys.modules, {"aiohttp": aiohttp_module}):
+            with patch("opencode.server._listener_owned_by_process", return_value=True):
+             with patch.dict(sys.modules, {"aiohttp": aiohttp_module}):
                 with patch("opencode.server.asyncio.sleep", new=AsyncMock()):
                     started = await server.restart_server(
                         "/tmp/opencode-work",
@@ -255,7 +256,8 @@ class ServerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch("opencode.server.subprocess.Popen", return_value=process):
-            with patch.dict(sys.modules, {"aiohttp": aiohttp_module}):
+            with patch("opencode.server._listener_owned_by_process", return_value=True):
+             with patch.dict(sys.modules, {"aiohttp": aiohttp_module}):
                 with patch("opencode.server.asyncio.sleep", new=AsyncMock()):
                     started = await server.restart_server(
                         "/tmp/opencode-work",

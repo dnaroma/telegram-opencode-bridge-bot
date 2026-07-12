@@ -12,6 +12,7 @@ import signal
 import subprocess
 import platform
 import shutil
+import socket
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,45 @@ async def _endpoint_is_reachable(hostname: str, port: int) -> bool:
 
 async def _wait_for_ready(hostname: str, port: int) -> bool:
     return await _endpoint_is_reachable(hostname, port)
+
+
+def _listener_owned_by_process(process, hostname: str, port: int) -> bool:
+    """Prove the managed PID owns the listener; health alone is insufficient."""
+    # Windows has no portable stdlib equivalent, but netstat exposes the
+    # owning PID.  Require both PID and LISTENING state (health is not proof
+    # of ownership).  psutil is accepted when available as a more precise
+    # implementation.
+    if platform.system() == "Windows":
+        try:
+            import psutil
+            for conn in psutil.net_connections(kind="tcp"):
+                if conn.laddr and conn.laddr.port == port and conn.pid == process.pid and conn.status == psutil.CONN_LISTEN:
+                    return hostname in ("0.0.0.0", "::", "127.0.0.1", "localhost") or conn.laddr.ip == hostname
+            return False
+        except Exception:
+            try:
+                result = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True, text=True, timeout=2)
+                pid = str(process.pid)
+                for line in result.stdout.splitlines():
+                    fields = line.split()
+                    if len(fields) >= 5 and fields[0].upper() == "TCP" and fields[3].upper() == "LISTENING" and fields[4] == pid:
+                        local = fields[1].rsplit(":", 1)
+                        if len(local) == 2 and local[1] == str(port):
+                            return local[0] in ("0.0.0.0", "::", "127.0.0.1", hostname, "[::]")
+                return False
+            except Exception:
+                return False
+    try:
+        result = subprocess.run(
+            ["lsof", "-nP", "-a", "-p", str(process.pid), "-iTCP:%d" % port, "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode != 0:
+            return False
+        output = result.stdout
+        return (":" + str(port)) in output and (hostname in ("0.0.0.0", "::", "127.0.0.1", "localhost") or hostname in output)
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 async def ensure_managed_server(
@@ -170,7 +210,9 @@ async def _restart_server_unlocked(directory: str, port: int = 8080, hostname: s
                 break
 
             await asyncio.sleep(1)
-            if await _wait_for_ready(hostname, port) and _server_process.poll() is None:
+            if (await _wait_for_ready(hostname, port)
+                    and _server_process.poll() is None
+                    and _listener_owned_by_process(_server_process, hostname, port)):
                 await asyncio.sleep(0.2)
                 if _server_process.poll() is not None:
                     logger.warning("opencode serve exited during readiness check on attempt %d", run_attempt)

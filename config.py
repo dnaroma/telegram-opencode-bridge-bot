@@ -92,6 +92,8 @@ class Config:
     webhook_url: str = field(
         default_factory=lambda: os.getenv('WEBHOOK_URL', '')
     )
+    webhook_path_secret: str = field(default_factory=lambda: os.getenv('WEBHOOK_PATH_SECRET', ''))
+    telegram_webhook_secret: str = field(default_factory=lambda: os.getenv('TELEGRAM_WEBHOOK_SECRET', ''))
     cloudflare_tunnel_token: str = field(
         default_factory=lambda: os.getenv('CLOUDFLARE_TUNNEL_TOKEN', '')
     )
@@ -116,6 +118,15 @@ class Config:
                 'WEBHOOK_MODE requires WEBHOOK_URL (e.g. https://bot.example.com). '
                 'CLOUDFLARE_TUNNEL_TOKEN is optional for auto-starting the tunnel.'
             )
+        if self.webhook_mode:
+            from urllib.parse import urlparse
+            parsed = urlparse(self.webhook_url)
+            if parsed.scheme != "https" or not parsed.netloc or parsed.query or parsed.fragment:
+                raise ValueError('WEBHOOK_URL must be an HTTPS origin without query or fragment')
+            if self.webhook_path_secret and len(self.webhook_path_secret) < 24:
+                raise ValueError('WEBHOOK_PATH_SECRET must be at least 24 characters')
+            if self.telegram_webhook_secret and len(self.telegram_webhook_secret) < 24:
+                raise ValueError('TELEGRAM_WEBHOOK_SECRET must be at least 24 characters')
 
 
 config = Config()

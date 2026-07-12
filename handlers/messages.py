@@ -97,6 +97,51 @@ async def ensure_server_running(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Enqueue one immutable message job and ensure one per-user drain worker."""
+    user_id = update.effective_user.id
+    text = sanitize_input(update.message.text or "")
+    states = context.bot_data.setdefault("message_worker_states", {})
+    state = states.setdefault(user_id, {"lock": asyncio.Lock(), "queue": asyncio.Queue(maxsize=32), "processing": False})
+    job = (update, text, update.message.message_id)
+    async with state["lock"]:
+        try:
+            state["queue"].put_nowait(job)
+        except asyncio.QueueFull:
+            await update.message.reply_text("⚠️ Message queue is full; please try again later.", parse_mode="HTML")
+            return
+        if state["processing"]:
+            await update.message.reply_text("📥 <i>Message queued — will be processed after the current task completes.</i>", parse_mode="HTML")
+            return
+        state["processing"] = True
+        worker = asyncio.create_task(_drain_message_queue(context, user_id, state))
+    # The Telegram handler must not own the worker: cancellation of this update
+    # must not cancel queued work.
+    return
+
+
+async def _drain_message_queue(context, user_id, state):
+    try:
+        while True:
+            async with state["lock"]:
+                try:
+                    job = state["queue"].get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+            try:
+                await _handle_message_impl(job[0], context, job[1], job[2], _from_worker=True)
+            except Exception:
+                logger.exception("Unhandled exception while processing queued message for user %s", user_id)
+    finally:
+        async with state["lock"]:
+            state["processing"] = False
+            if not state["queue"].empty():
+                state["processing"] = True
+                asyncio.create_task(_drain_message_queue(context, user_id, state))
+
+
+async def _handle_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                               queued_text=None, queued_message_id=None,
+                               _from_worker=False) -> None:
     """Handle incoming text messages by routing them to OpenCode.
 
     Flow:
@@ -109,7 +154,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """
     user = update.effective_user
     user_id = user.id
-    message_text = sanitize_input(update.message.text or "")
+    message_text = queued_text if queued_text is not None else sanitize_input(update.message.text or "")
 
     # ── Check if user is in the middle of adding an MCP server ───────
     mcp_state = context.user_data.get("mcp_state")
@@ -117,12 +162,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await handle_mcp_input(update, context, mcp_state)
         return
 
-    # ── Check if user is answering a question ───────
+    # ── Check if user is answering a request-scoped question ───────
     awaiting_question = context.user_data.get("awaiting_question_answer")
     if awaiting_question:
-        short_key = awaiting_question
-        pending_questions = context.bot_data.get("pending_questions", {})
-        pending = pending_questions.get(short_key)
+        if isinstance(awaiting_question, dict):
+            short_key = awaiting_question.get("token")
+            question_version = awaiting_question.get("version")
+        else:
+            short_key = awaiting_question
+            question_version = None
+        from handlers.question_state import get
+        pending = get(context.bot_data, short_key, user_id, update.effective_chat.id)
         
         if pending:
             session_id = pending["session_id"]
@@ -132,13 +182,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             try:
                 if not oc_client:
                     raise RuntimeError("OpenCode client not available")
-                await oc_client.respond_to_question(
-                    session_id=session_id,
-                    question_id=question_id,
-                    answers=[[message_text]]
+                from handlers.question_state import apply_callback, discard, retry_markup, submission_failed
+                pending, submitted, state_error = await apply_callback(
+                    context.bot_data, short_key, user_id, update.effective_chat.id,
+                    "custom", custom=message_text, version=question_version,
                 )
-                
-                pending_questions.pop(short_key, None)
+                if state_error:
+                    raise RuntimeError("Question expired or invalid")
+                if not submitted:
+                    context.user_data["awaiting_question_answer"] = short_key
+                    from handlers.question_state import render_current_question
+                    pending["rendered"] = False
+                    await render_current_question(update, context, short_key, pending)
+                    return
+                success = await oc_client.respond_to_question(session_id=session_id, question_id=question_id, answers=pending["answers"])
+                if success is not True:
+                    submission_failed(pending)
+                    # The custom prompt callback has been consumed and the
+                    # state version advanced. Replace it with the completed
+                    # version so a subsequent retry is not rejected as stale.
+                    context.user_data["awaiting_question_answer"] = {
+                        "token": short_key,
+                        "version": pending.get("version", 0),
+                    }
+                    await update.message.reply_text(
+                        "⚠️ OpenCode did not accept the answer. Please try again.",
+                        parse_mode="HTML",
+                        reply_markup=retry_markup(short_key, pending),
+                    )
+                    return
+                discard(context.bot_data, short_key)
                 context.user_data.pop("awaiting_question_answer", None)
                 
                 await update.message.reply_text(
@@ -147,10 +220,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
                 return
             except Exception as e:
+                if pending:
+                    submission_failed(pending)
+                    context.user_data["awaiting_question_answer"] = {
+                        "token": short_key,
+                        "version": pending.get("version", 0),
+                    }
                 logger.error(f"Failed to submit question answer: {e}", exc_info=True)
                 await update.message.reply_text(
                     f"⚠️ Failed to submit answer: {e}",
-                    parse_mode="HTML"
+                    parse_mode="HTML",
+                    reply_markup=retry_markup(short_key, pending) if pending else None,
                 )
                 return
         else:
@@ -165,40 +245,59 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not message_text or not message_text.strip():
         return
 
-    # ── Prevent concurrent message processing per user ───────
+    if _from_worker:
+        # The outer worker owns serialization; this invocation processes one job only.
+        pass
+    else:
+        # Direct callers are routed through the same queue entry point.
+        return await handle_message(update, context)
+
+    # ── Per-user worker state is owned by handle_message ───────
     # If a previous prompt is still being processed, queue the new one
     # instead of running it concurrently (which causes replay bugs).
     bot_data = context.bot_data
     session_mgr = bot_data["session_manager"]
 
-    # Per-user message queue to serialize processing
-    user_queue: asyncio.Queue = context.user_data.setdefault("message_queue", asyncio.Queue())
-    is_processing = context.user_data.get("message_processing", False)
+    # Per-user message queue to serialize processing.  The test-and-claim is
+    # deliberately one critical section: releasing the lock between these
+    # operations lets two Telegram updates both become the worker.
+    states = bot_data.setdefault("message_worker_states", {})
+    state = states.setdefault(user_id, {"lock": asyncio.Lock(), "queue": asyncio.Queue(maxsize=32), "processing": False})
+    user_queue = state["queue"]
+    async with state["lock"]:
+        if state["processing"] and not _from_worker:
+            try:
+                state["queue"].put_nowait((update, message_text, update.message.message_id))
+            except asyncio.QueueFull:
+                await update.message.reply_text("⚠️ Message queue is full; please try again later.", parse_mode="HTML")
+                return
 
-    if is_processing:
-        # Enqueue the message WITH its message_id so replies can quote the original
-        await user_queue.put((message_text, update.message.message_id))
-        await update.message.reply_text(
-            "📥 <i>Message queued — will be processed after the current task completes.</i>",
-            parse_mode="HTML"
-        )
-        return
+            # The already-running drain owns all subsequent work.  In
+            # particular, never create a second handler task for this user.
+            await update.message.reply_text(
+                "📥 <i>Message queued — will be processed after the current task completes.</i>",
+                parse_mode="HTML",
+            )
+            return
+
+        # Claim the persistent drain worker in the same critical section as
+        # enqueue/claim.  This is the only place a worker may be created.
+        state["processing"] = True
 
     status_msg = None
     status_msg_holder = None
     sse_task = None
     typing_task = None
 
-    context.user_data["message_processing"] = True
-
     config = bot_data["config"]
     oc_client = bot_data["opencode_client"]
 
     try:
-        # Process the current message, then drain the queue
-        messages_to_process = [(message_text, update.message.message_id)]
+        # Process exactly this immutable job. The outer worker pops the next job.
+        messages_to_process = [(update, message_text, update.message.message_id)]
         while messages_to_process:
-            current_message, reply_to_msg_id = messages_to_process.pop(0)
+            delivery_update, current_message, reply_to_msg_id = messages_to_process.pop(0)
+            update = delivery_update
 
     # ── 1. Ensure OpenCode server is running ────────────────
             if not await ensure_server_running(update, context, user_id):
@@ -296,6 +395,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     prompt=current_message,
                     model=session_model,
                     agent=session_mode,
+                    variant=await session_mgr.get_variant(user_id),
                 )
 
                 if response_text is None:
@@ -309,6 +409,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         prompt=current_message,
                         model=session_model,
                         agent=session_mode,
+                        variant=await session_mgr.get_variant(user_id),
                     )
             except OpenCodeConnectionError as conn_err:
                 logger.warning(f"Connection lost to OpenCode server: {conn_err}. Attempting to recover...")
@@ -331,6 +432,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         prompt=current_message,
                         model=session_model,
                         agent=session_mode,
+                        variant=await session_mgr.get_variant(user_id),
                     )
                 else:
                     raise conn_err
@@ -365,6 +467,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         prompt=current_message,
                         model=session_model,
                         agent=session_mode,
+                        variant=await session_mgr.get_variant(user_id),
                     )
                 else:
                     raise
@@ -462,11 +565,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         parse_mode="HTML",
                         reply_to_message_id=reply_to_msg_id,
                     )
-                while not user_queue.empty():
-                    try:
-                        messages_to_process.append(user_queue.get_nowait())
-                    except asyncio.QueueEmpty:
-                        break
                 continue
 
             for resp in all_responses:
@@ -511,12 +609,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     if i < len(chunks) - 1:
                         await asyncio.sleep(0.5)
 
-            # Drain the queue for the next iteration
-            while not user_queue.empty():
-                try:
-                    messages_to_process.append(user_queue.get_nowait())
-                except asyncio.QueueEmpty:
-                    break
+            # The outer per-user worker owns queue draining. Do not pre-drain jobs here.
+            break
 
     except Exception as outer_e:
         logger.error(f"Unexpected error in message processing loop: {outer_e}", exc_info=True)
@@ -529,7 +623,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception:
             pass
     finally:
-        context.user_data["message_processing"] = False
+        # _drain_message_queue owns the worker flag and clears it only after
+        # atomically observing an empty queue.
+        if not _from_worker:
+            async with state["lock"]:
+                state["processing"] = False
 
 
 async def _create_session(oc_client, user_id, session_mgr, config):
@@ -562,14 +660,14 @@ async def _create_session(oc_client, user_id, session_mgr, config):
     return session_id
 
 
-async def _send_to_opencode(oc_client, session_id, prompt, model, agent):
+async def _send_to_opencode(oc_client, session_id, prompt, model, agent, variant=None):
     """Send a prompt to OpenCode HTTP API.
 
     Returns:
         The response text from OpenCode, or None if the session does not exist.
     """
     logger.info(f"Sending to OpenCode API: session={session_id[:8]}... model={model} agent={agent}")
-    response = await oc_client.send_message(session_id, prompt, model=model, agent=agent)
+    response = await oc_client.send_message(session_id, prompt, model=model, variant=variant, agent=agent)
     if response is None:
         return None
     if response.error_message:
@@ -944,86 +1042,14 @@ async def _listen_and_stream_events(
                                     logger.warning("Received question.asked event but no questions array found in properties.")
                                     continue
 
-                                if "pending_questions" not in context.bot_data:
-                                    context.bot_data["pending_questions"] = {}
+                                from handlers.question_state import create, render_current_question
+                                chat_id = update.effective_chat.id if update.effective_chat else None
+                                token, question_record = create(context.bot_data, update.effective_user.id, chat_id, event_session_id or session_id, question_id, questions_list)
 
-                                for q_idx, q_item in enumerate(questions_list):
-                                    q_header = q_item.get("header", "")
-                                    q_text = q_item.get("question", "")
-                                    q_options = q_item.get("options", [])
-                                    q_multiple = q_item.get("multiple", False)
-                                    q_custom = q_item.get("custom", True)
-
-                                    if not q_text:
-                                        continue
-
-                                    short_key = uuid.uuid4().hex[:8]
-                                    context.bot_data["pending_questions"][short_key] = {
-                                        "session_id": session_id,
-                                        "question_id": question_id,
-                                        "chat_id": update.effective_chat.id if update.effective_chat else None,
-                                    }
-
-                                    header_prefix = f"<b>{html.escape(q_header)}</b>\n\n" if q_header else ""
-                                    msg = f"❓ {header_prefix}{html.escape(q_text)}"
-                                    if q_multiple:
-                                        msg += "\n\n<i>You may select multiple options.</i>"
-                                    msg += "\n\n⚠️ <i>Please answer quickly — the question times out after ~30 seconds.</i>"
-
-                                    keyboard = []
-                                    MAX_Q_OPTIONS = 10
-                                    display_options = q_options[:MAX_Q_OPTIONS] if isinstance(q_options, list) else []
-
-                                    for idx, opt in enumerate(display_options):
-                                        if isinstance(opt, dict):
-                                            label = opt.get("label", f"Option {idx+1}")
-                                            desc = opt.get("description", "")
-                                            display_label = label[:50]
-                                            if desc and len(label) + len(desc) < 55:
-                                                display_label = f"{label[:30]} — {desc[:20]}"
-                                            cb_value = label[:40]
-                                        else:
-                                            display_label = str(opt)[:50]
-                                            cb_value = display_label
-
-                                        keyboard.append([InlineKeyboardButton(
-                                            display_label,
-                                            callback_data=f"question:{short_key}:{cb_value}"
-                                        )])
-
-                                    if isinstance(q_options, list) and len(q_options) > MAX_Q_OPTIONS:
-                                        msg += f"\n\n<i>(Showing {MAX_Q_OPTIONS} of {len(q_options)} options)</i>"
-
-                                    if q_custom:
-                                        keyboard.append([InlineKeyboardButton(
-                                            "✏️ Type custom answer",
-                                            callback_data=f"question:{short_key}:__custom__"
-                                        )])
-
-                                    try:
-                                        chunks = split_message(msg, context.bot_data["config"].max_message_length)
-                                        if keyboard:
-                                            for chunk in chunks[:-1]:
-                                                await update.message.reply_text(chunk, parse_mode="HTML")
-                                            sent_msg = await update.message.reply_text(
-                                                chunks[-1],
-                                                parse_mode="HTML",
-                                                reply_markup=InlineKeyboardMarkup(keyboard)
-                                            )
-                                        else:
-                                            for chunk in chunks:
-                                                await update.message.reply_text(chunk, parse_mode="HTML")
-                                            context.user_data["awaiting_question_answer"] = short_key
-                                            sent_msg = None
-
-                                        if sent_msg:
-                                            context.bot_data["pending_questions"][short_key]["telegram_msg_id"] = sent_msg.message_id
-                                    except Exception as e:
-                                        logger.error(f"Failed to send question prompt: {e}")
-                                        fallback_msg = f"❓ Question:\n\n{html.escape(q_text)}\n\n<i>Please reply with your answer.</i>"
-                                        for chunk in split_message(fallback_msg, context.bot_data["config"].max_message_length):
-                                            await update.message.reply_text(chunk, parse_mode="HTML")
-                                        context.user_data["awaiting_question_answer"] = short_key
+                                if question_record.get("rendered"):
+                                    continue
+                                await render_current_question(update, context, token, question_record)
+                                continue
 
                             # B. Handle Tool Execution Progress
                             elif event_type == "message.part.updated":
@@ -1142,7 +1168,7 @@ async def _listen_and_stream_events(
                                                             pass
                                                     del pending_questions[ek]
 
-                                        # New question — render with buttons
+                                        # New question — normalize every ingress through the request state machine.
                                         if status in ("pending", "running") and call_id not in notified_calls:
                                             notified_calls.add(call_id)
                                             completed_calls.add(call_id)
@@ -1154,7 +1180,21 @@ async def _listen_and_stream_events(
                                             if not isinstance(questions_list, list) or not questions_list:
                                                 continue
 
-                                            for q_item in questions_list:
+                                            from handlers.question_state import create, render_current_question
+                                            request_id = (input_data.get("id") or input_data.get("questionID") or
+                                                          input_data.get("questionId"))
+                                            if not request_id:
+                                                logger.debug("Deferring question tool without a request ID: %s", call_id)
+                                                continue
+                                            token, record = create(
+                                                context.bot_data, update.effective_user.id,
+                                                update.effective_chat.id if update.effective_chat else None,
+                                                session_id, request_id, questions_list,
+                                            )
+                                            if not record.get("rendered"):
+                                                await render_current_question(update, context, token, record)
+                                            continue
+                                            for q_item in []:  # legacy renderer intentionally unreachable
                                                 q_header = q_item.get("header", "")
                                                 q_text = q_item.get("question", "")
                                                 q_options = q_item.get("options", [])
@@ -1206,7 +1246,7 @@ async def _listen_and_stream_events(
 
                                                     keyboard.append([InlineKeyboardButton(
                                                         display_label,
-                                                        callback_data=f"question:{question_key}:{cb_value}"
+                                                        callback_data=f"question:{question_key}:0:o:{idx}"
                                                     )])
 
                                                 if isinstance(q_options, list) and len(q_options) > MAX_Q_OPTIONS:
@@ -1214,7 +1254,7 @@ async def _listen_and_stream_events(
 
                                                 keyboard.append([InlineKeyboardButton(
                                                     "✏️ Type custom answer",
-                                                    callback_data=f"question:{question_key}:__custom__"
+                                                    callback_data=f"question:{question_key}:0:custom"
                                                 )])
 
                                                 try:
@@ -1379,54 +1419,15 @@ async def _listen_and_stream_events(
                                 if isinstance(input_data, dict):
                                     questions_list = input_data.get("questions", [])
                                     if isinstance(questions_list, list):
-                                        for q_item in questions_list:
-                                            q_header = q_item.get("header", "")
-                                            q_text = q_item.get("question", "")
-                                            q_options = q_item.get("options", [])
-                                            q_multiple = q_item.get("multiple", False)
-                                            if q_text:
-                                                notified_calls.add(q_call_id)
-                                                completed_calls.add(q_call_id)
-                                                if "pending_questions" not in context.bot_data:
-                                                    context.bot_data["pending_questions"] = {}
-                                                qkey = uuid.uuid4().hex[:8]
-                                                context.bot_data["pending_questions"][qkey] = {
-                                                    "session_id": session_id,
-                                                    "call_id": q_call_id,
-                                                    "question_id": q_call_id,
-                                                    "chat_id": update.effective_chat.id if update.effective_chat else None,
-                                                }
-                                                header_prefix = f"<b>{html.escape(q_header)}</b>\n\n" if q_header else ""
-                                                qmsg = f"❓ {header_prefix}{html.escape(q_text)}"
-                                                if q_multiple:
-                                                    qmsg += "\n\n<i>You may select multiple options.</i>"
-                                                qmsg += "\n\n⚠️ <i>Please answer quickly — the question times out after ~30 seconds.</i>"
-                                                kb = []
-                                                for idx, opt in enumerate(q_options[:10]):
-                                                    if isinstance(opt, dict):
-                                                        lbl = opt.get("label", f"Option {idx+1}")
-                                                        val = opt.get("value", lbl)
-                                                        desc = opt.get("description", "")
-                                                        dl = lbl[:50]
-                                                        if desc and len(lbl) + len(desc) < 55:
-                                                            dl = f"{lbl[:30]} — {desc[:20]}"
-                                                        cbv = val[:40]
-                                                    else:
-                                                        dl = str(opt)[:50]
-                                                        cbv = dl
-                                                    kb.append([InlineKeyboardButton(dl, callback_data=f"question:{qkey}:{cbv}")])
-                                                kb.append([InlineKeyboardButton("✏️ Type custom answer", callback_data=f"question:{qkey}:__custom__")])
-                                                try:
-                                                    chunks = split_message(qmsg, context.bot_data["config"].max_message_length)
-                                                    for chunk in chunks[:-1]:
-                                                        await update.message.reply_text(chunk, parse_mode="HTML")
-                                                    sent_msg = await update.message.reply_text(
-                                                        chunks[-1], parse_mode="HTML",
-                                                        reply_markup=InlineKeyboardMarkup(kb)
-                                                    )
-                                                    context.bot_data["pending_questions"][qkey]["telegram_msg_id"] = sent_msg.message_id
-                                                except Exception as ex:
-                                                    logger.error(f"Failed to render missed question from poll: {ex}")
+                                        request_id = input_data.get("id") or input_data.get("questionID") or input_data.get("questionId")
+                                        if request_id:
+                                            from handlers.question_state import create, render_current_question
+                                            token, record = create(context.bot_data, update.effective_user.id,
+                                                update.effective_chat.id if update.effective_chat else None,
+                                                session_id, request_id, questions_list)
+                                            notified_calls.add(q_call_id)
+                                            if not record.get("rendered"):
+                                                await render_current_question(update, context, token, record)
             except Exception as poll_err:
                 logger.warning(f"Failed to poll for missed events during SSE reconnect: {poll_err}")
 
@@ -1746,6 +1747,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 prompt=prompt_text,
                 model=session_model,
                 agent=session_mode,
+                variant=await session_mgr.get_variant(user_id),
             )
 
             # Increment count
@@ -2035,7 +2037,14 @@ async def handle_mcp_input(update: Update, context: ContextTypes.DEFAULT_TYPE, s
         current_dir = os.path.abspath(current_dir)
         
         from utils.config_parser import add_mcp_server
-        add_mcp_server(current_dir, name, mcp_config)
+        try:
+            add_mcp_server(current_dir, name, mcp_config)
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ Could not save this MCP server configuration. Please try again.",
+                parse_mode="HTML",
+            )
+            return
         
         # Reset state immediately to avoid double-processing
         context.user_data.pop("mcp_state", None)
@@ -2082,7 +2091,15 @@ async def handle_mcp_input(update: Update, context: ContextTypes.DEFAULT_TYPE, s
         current_dir = os.path.abspath(current_dir)
         
         from utils.config_parser import add_mcp_server
-        add_mcp_server(current_dir, name, mcp_config)
+        try:
+            add_mcp_server(current_dir, name, mcp_config)
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ This MCP server configuration is invalid or already exists. "
+                "Please choose a different name or review the entered values.",
+                parse_mode="HTML",
+            )
+            return
         
         # Reset state immediately
         context.user_data.pop("mcp_state", None)

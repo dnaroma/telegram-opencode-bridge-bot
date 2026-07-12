@@ -2,6 +2,7 @@ import os
 import json
 import re
 import logging
+import tempfile
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,16 @@ def find_config_file(work_dir: str) -> str:
     # Default to project-local json
     default_p = os.path.join(work_dir, ".opencode", "opencode.json")
     return os.path.abspath(default_p)
+
+def config_source(work_dir: str) -> tuple[str, str]:
+    """Return (path, layer), never hiding that a config is inherited."""
+    project = [p for p in _config_candidates(work_dir)[:4] if os.path.isfile(p)]
+    if project:
+        return os.path.abspath(project[0]), "project"
+    global_files = [p for p in _config_candidates(work_dir)[4:] if os.path.isfile(p)]
+    if global_files:
+        return os.path.abspath(global_files[0]), "global"
+    return os.path.abspath(os.path.join(work_dir, ".opencode", "opencode.json")), "project"
 
 def parse_jsonc(content: str) -> dict:
     """Strips comments and trailing commas from JSONC content and parses it."""
@@ -63,8 +74,13 @@ def save_config(file_path: str, config: dict) -> None:
     """Saves the config dictionary as formatted JSON. Creates parent folders if needed."""
     try:
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        with open(file_path, 'w', encoding='utf-8') as f:
+        directory = os.path.dirname(file_path)
+        fd, temporary = tempfile.mkstemp(dir=directory, prefix='.opencode-', suffix='.tmp')
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, file_path)
     except Exception as e:
         logger.error(f"Failed to save config to {file_path}: {e}")
         raise
@@ -81,14 +97,18 @@ def get_mcp_servers(work_dir: str) -> dict:
 
 def update_mcp_servers(work_dir: str, mcp_servers: dict) -> None:
     """Update the entire mcp section in the config file."""
-    config_file = find_config_file(work_dir)
+    config_file, layer = config_source(work_dir)
+    if layer != "project":
+        config_file = os.path.abspath(os.path.join(work_dir, ".opencode", "opencode.json"))
     config = read_config(config_file)
     config["mcp"] = mcp_servers
     save_config(config_file, config)
 
 def toggle_mcp_server(work_dir: str, name: str, enabled: bool) -> bool:
     """Toggle the enabled status of an MCP server."""
-    config_file = find_config_file(work_dir)
+    config_file, layer = config_source(work_dir)
+    if layer != "project":
+        return False
     config = read_config(config_file)
     if "mcp" not in config:
         config["mcp"] = {}
@@ -101,7 +121,10 @@ def toggle_mcp_server(work_dir: str, name: str, enabled: bool) -> bool:
 
 def add_mcp_server(work_dir: str, name: str, mcp_config: dict) -> None:
     """Add or overwrite an MCP server configuration."""
-    config_file = find_config_file(work_dir)
+    config_file, layer = config_source(work_dir)
+    if layer != "project":
+        # Never mutate the inherited global source; create a local override.
+        config_file = os.path.abspath(os.path.join(work_dir, ".opencode", "opencode.json"))
     config = read_config(config_file)
     if "mcp" not in config:
         config["mcp"] = {}
@@ -111,7 +134,9 @@ def add_mcp_server(work_dir: str, name: str, mcp_config: dict) -> None:
 
 def delete_mcp_server(work_dir: str, name: str) -> bool:
     """Delete an MCP server from the configuration."""
-    config_file = find_config_file(work_dir)
+    config_file, layer = config_source(work_dir)
+    if layer != "project":
+        return False
     config = read_config(config_file)
     if "mcp" in config and name in config["mcp"]:
         del config["mcp"][name]

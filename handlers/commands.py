@@ -8,6 +8,7 @@ Handles all slash commands: /start, /help, /new, /sessions,
 import html
 import logging
 import os
+import time
 
 from telegram import Update, BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
@@ -1467,7 +1468,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     import os
-    logger.info(f"Callback query received from user {user_id}: {data}")
+    logger.info("Callback query received from authorized user %s (action=%s)", user_id, data.split(":", 1)[0])
 
     # ── Process Kill Callbacks ──────────────────────────────────────────
     if data.startswith("ps_kill:"):
@@ -1528,7 +1529,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         current_dir = os.path.abspath(current_dir)
         
         from utils.config_parser import toggle_mcp_server
-        toggle_mcp_server(current_dir, mcp_name, enabled)
+        try:
+            changed = toggle_mcp_server(current_dir, mcp_name, enabled)
+        except ValueError:
+            await query.edit_message_text(
+                "⚠️ This project action cannot alter inherited global MCP configuration.", parse_mode="HTML"
+            )
+            return
+
+        if not changed:
+            await query.edit_message_text(
+                f"ℹ️ MCP server <code>{html.escape(mcp_name)}</code> was not changed. "
+                "It is inherited or has no project-level configuration to toggle.",
+                parse_mode="HTML",
+            )
+            return
         
         await query.edit_message_text(
             f"🔄 <b>Toggling MCP server {html.escape(mcp_name)}...</b>\n"
@@ -1564,7 +1579,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         current_dir = os.path.abspath(current_dir)
         
         from utils.config_parser import delete_mcp_server
-        delete_mcp_server(current_dir, mcp_name)
+        try:
+            changed = delete_mcp_server(current_dir, mcp_name)
+        except ValueError:
+            await query.edit_message_text(
+                "⚠️ This project action cannot alter inherited global MCP configuration.", parse_mode="HTML"
+            )
+            return
+
+        if not changed:
+            await query.edit_message_text(
+                f"ℹ️ MCP server <code>{html.escape(mcp_name)}</code> was not deleted. "
+                "It has no project-level configuration entry (an inherited server is unchanged).",
+                parse_mode="HTML",
+            )
+            return
         
         await query.edit_message_text(
             f"🗑️ <b>Deleting MCP server {html.escape(mcp_name)}...</b>\n"
@@ -1647,7 +1676,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         current_dir = os.path.abspath(current_dir)
         
         from utils.config_parser import add_mcp_server
-        add_mcp_server(current_dir, name, mcp_config)
+        try:
+            add_mcp_server(current_dir, name, mcp_config)
+        except ValueError:
+            await query.edit_message_text(
+                "⚠️ This project action cannot alter inherited global MCP configuration.", parse_mode="HTML"
+            )
+            return
+        except Exception as e:
+            logger.error("Failed to add MCP server", exc_info=True)
+            await query.edit_message_text(
+                f"⚠️ <b>Could not add MCP server:</b> {html.escape(str(e))}", parse_mode="HTML"
+            )
+            return
         
         # Reset state immediately
         context.user_data.pop("mcp_state", None)
@@ -2205,13 +2246,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # 1.6 Handle Question Responses
     elif data.startswith("question:"):
-        parts = data.split(":", 2)
-        if len(parts) >= 3:
-            short_key = parts[1]
-            answer = parts[2]
+        from handlers.question_state import parse_callback, apply_callback, render_current_question, retry_markup
+        parsed = parse_callback(data)
+        if parsed:
+            short_key, version, action, option_index = parsed
+            answer = action
             
-            pending_questions = bot_data.get("pending_questions", {})
-            pending = pending_questions.get(short_key)
+            pending = bot_data.get("question_callbacks", {}).get(short_key)
             
             if not pending:
                 await query.edit_message_text(
@@ -2220,14 +2261,41 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 )
                 return
             
-            if answer == "__custom__":
-                context.user_data["awaiting_question_answer"] = short_key
+            if action == "custom":
+                # Do not resurrect an old prompt after the final answer has
+                # completed (or while a submission is being attempted).
+                if (
+                    pending.get("submitted") or pending.get("in_flight")
+                    or version != pending.get("version", 0)
+                    or pending.get("index", 0) >= len(pending.get("questions", []))
+                ):
+                    await query.answer("Question expired or invalid", show_alert=True)
+                    return
+                context.user_data["awaiting_question_answer"] = {
+                    "token": short_key,
+                    "version": version,
+                }
                 await query.edit_message_text(
                     text=f"{query.message.text}\n\n✏️ <i>Please type your custom answer as a regular message.</i>",
                     parse_mode="HTML"
                 )
                 return
                 
+            pending, submitted, state_error = await apply_callback(
+                bot_data, short_key, user_id, query.message.chat_id,
+                action, index=option_index, version=version,
+            )
+            if state_error:
+                if state_error == "custom_input":
+                    return
+                await query.answer("Question expired or invalid", show_alert=True)
+                return
+            if not submitted:
+                await query.answer("Selection updated")
+                if pending.get("index", 0) < len(pending.get("questions", [])) and action in {"option", "done"}:
+                    pending["rendered"] = False
+                    await render_current_question(query, context, short_key, pending)
+                return
             session_id = pending["session_id"]
             question_id = pending["question_id"]
             chat_id = pending.get("chat_id")
@@ -2238,10 +2306,38 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 success = await oc_client.respond_to_question(
                     session_id=session_id,
                     question_id=question_id,
-                    answers=[[answer]]
+                    answers=pending["answers"]
                 )
                 
-                pending_questions.pop(short_key, None)
+                if success is not True:
+                    from handlers.question_state import submission_failed
+                    submission_failed(pending)
+                    await query.answer("OpenCode rejected the answer; please retry", show_alert=True)
+                    retry_text = (
+                        f"{query.message.text}\n\n⚠️ <b>Submission rejected:</b> "
+                        "your completed answers were preserved. Use Retry submission to try again."
+                    )
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id, message_id=telegram_msg_id,
+                            text=retry_text, parse_mode="HTML",
+                            reply_markup=retry_markup(short_key, pending),
+                        )
+                    except Exception:
+                        await query.edit_message_text(
+                            text=retry_text, parse_mode="HTML",
+                            reply_markup=retry_markup(short_key, pending),
+                        )
+                    return
+
+                from handlers.question_state import discard
+                discard(bot_data, short_key)
+                awaiting = context.user_data.get("awaiting_question_answer")
+                if (
+                    (isinstance(awaiting, dict) and awaiting.get("token") == short_key)
+                    or awaiting == short_key
+                ):
+                    context.user_data.pop("awaiting_question_answer", None)
 
                 if telegram_msg_id and chat_id:
                     try:
@@ -2263,24 +2359,29 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     )
             except Exception as e:
                 logger.error(f"Error responding to question {question_id} in callback: {e}", exc_info=True)
-                pending_questions.pop(short_key, None)
+                from handlers.question_state import submission_failed
+                submission_failed(pending)
+                retry_text = (
+                    f"{query.message.text}\n\n⚠️ <b>Failed to submit:</b> "
+                    "your completed answers were preserved. Use Retry submission to try again."
+                )
                 if telegram_msg_id and chat_id:
                     try:
                         await context.bot.edit_message_text(
                             chat_id=chat_id,
                             message_id=telegram_msg_id,
-                            text=f"{query.message.text}\n\n⚠️ <b>Failed to submit:</b> The question has expired or an error occurred. The agent will retry or adjust its approach.",
-                            parse_mode="HTML"
+                            text=retry_text, parse_mode="HTML",
+                            reply_markup=retry_markup(short_key, pending),
                         )
                     except Exception:
                         await query.edit_message_text(
-                            text=f"{query.message.text}\n\n⚠️ <b>Error:</b> Failed to submit answer — the question may have already timed out.",
-                            parse_mode="HTML"
+                            text=retry_text, parse_mode="HTML",
+                            reply_markup=retry_markup(short_key, pending),
                         )
                 else:
                     await query.edit_message_text(
-                        text=f"{query.message.text}\n\n⚠️ <b>Error:</b> Failed to submit answer — the question may have already timed out.",
-                        parse_mode="HTML"
+                        text=retry_text, parse_mode="HTML",
+                        reply_markup=retry_markup(short_key, pending),
                     )
 
     # 2. Switch Model tap
@@ -2354,6 +2455,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 callback_data="noop"
             )])
             
+            import secrets, time
+            variant_store = bot_data.setdefault("variant_callbacks", {})
             for variant in variants:
                 if isinstance(variant, dict):
                     variant_id = variant.get("id", "")
@@ -2363,7 +2466,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     variant_name = str(variant)
                 
                 # Include provider in the path: provider/model/variant
-                variant_path = f"{provider_id}/{model_id}/{variant_id}"
+                variant_path = secrets.token_urlsafe(8)
+                variant_store[variant_path] = {"user_id": user_id, "chat_id": query.message.chat_id,
+                    "provider": provider_id, "model": model_id, "variant": str(variant_id),
+                    "expires": time.monotonic() + 120}
                 
                 variants_keyboard.append([InlineKeyboardButton(
                     f"✨ {variant_name}",
@@ -2385,8 +2491,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith("modelvariant:"):
         variant_path = data[len("modelvariant:"):]
         
-        # variant_path format: model_id/variant_id (e.g., "google/gemini-2.5-pro/high")
-        await session_mgr.set_model(user_id, variant_path)
+        # Keep callback data short and resolve the complete selection server-side.
+        record = bot_data.get("variant_callbacks", {}).pop(variant_path, None)
+        if record and record.get("expires", 0) > time.monotonic() and record.get("user_id") == user_id and record.get("chat_id") == query.message.chat_id:
+            provider_id, model_id, variant_id = record["provider"], record["model"], record["variant"]
+            await session_mgr.set_model(user_id, f"{provider_id}/{model_id}", variant=variant_id)
+            variant_path = f"{provider_id}/{model_id}/{variant_id}"
+        else:
+            await query.answer("This selection expired", show_alert=True)
+            return
         await query.edit_message_text(
             f"✅ Model variant changed to <code>{html.escape(variant_path)}</code>\n\n"
             f"<i>This applies to your current session.</i>",

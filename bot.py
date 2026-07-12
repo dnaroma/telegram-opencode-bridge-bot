@@ -20,6 +20,8 @@ import sys
 import os
 import time
 import subprocess
+import secrets
+from urllib.parse import urlparse
 
 # Switch to Selector Event Loop on Windows for robust signal handling and clean shutdowns
 if sys.platform == 'win32':
@@ -81,6 +83,8 @@ logging.basicConfig(
 logger = logging.getLogger("opencode-telegram-bot")
 
 _lock_file = None
+_webhook_path_secret = None
+_telegram_webhook_secret = None
 
 def acquire_bot_lock():
     """Acquire an exclusive lock file to prevent multiple instances from running concurrently."""
@@ -719,6 +723,10 @@ def _run_polling_mode():
 def _resolve_webhook_url() -> str | None:
     """Return the public webhook base URL (must be set via WEBHOOK_URL env var)."""
     if config.webhook_url:
+        parsed = urlparse(config.webhook_url)
+        if parsed.scheme != "https" or not parsed.netloc or parsed.query or parsed.fragment:
+            logger.error("WEBHOOK_URL must be an HTTPS origin without query or fragment")
+            return None
         return config.webhook_url.rstrip("/")
 
     logger.error(
@@ -741,7 +749,15 @@ def _run_webhook_mode():
         _run_polling_mode()
         return
 
-    webhook_path = f"/bot/{config.telegram_bot_token}"
+    # Never put credentials in the URL.  A configured path is stable across
+    # crash-loop rebuilds; the fallback is generated once per process.
+    global _webhook_path_secret, _telegram_webhook_secret
+    if not _webhook_path_secret:
+        _webhook_path_secret = config.webhook_path_secret or secrets.token_urlsafe(32)
+    if not _telegram_webhook_secret:
+        _telegram_webhook_secret = config.telegram_webhook_secret or secrets.token_urlsafe(32)
+    telegram_secret = _telegram_webhook_secret
+    webhook_path = f"/bot/{_webhook_path_secret}"
     full_webhook_url = f"{webhook_base}{webhook_path}"
 
     crash_count = 0
@@ -751,12 +767,13 @@ def _run_webhook_mode():
         try:
             application = _build_application()
             logger.info(f"Starting bot in webhook mode on port {config.webhook_port}…")
-            logger.info(f"  Webhook URL: {full_webhook_url}")
+            logger.info("  Webhook URL configured (secret path redacted)")
             application.run_webhook(
                 listen="0.0.0.0",
                 port=config.webhook_port,
                 url_path=webhook_path,
                 webhook_url=full_webhook_url,
+                secret_token=telegram_secret,
                 allowed_updates=["message", "callback_query"],
                 drop_pending_updates=True,
             )

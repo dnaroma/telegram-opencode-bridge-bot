@@ -327,7 +327,8 @@ class OpenCodeClient:
         self,
         session_id: str,
         content: str,
-        model: Optional[str] = None,
+        model: Optional[Any] = None,
+        variant: Optional[str] = None,
         agent: Optional[str] = None,
     ) -> Optional[OpenCodeMessage]:
         """Send a prompt to an OpenCode session and return the response.
@@ -354,23 +355,24 @@ class OpenCodeClient:
             payload["agent"] = agent.strip()
 
         if model:
-            # Support format: provider/model or provider/model/variant
-            parts = model.split("/")
-            if len(parts) >= 2:
-                provider_id = parts[0]
-                model_id = parts[1]
-                variant_id = parts[2] if len(parts) >= 3 else None
-                
+            if isinstance(model, dict):
+                payload["model"] = {
+                    "providerID": model.get("providerID", model.get("provider_id", "")),
+                    "modelID": model.get("modelID", model.get("model_id", "")),
+                }
+                variant = variant or model.get("variant")
+            else:
+                parts = str(model).split("/", 1)
+                if len(parts) >= 2:
+                    provider_id, model_id = parts
+                else:
+                    provider_id, model_id = "", parts[0]
                 payload["model"] = {
                     "providerID": provider_id.strip(),
                     "modelID": model_id.strip(),
                 }
-                if variant_id:
-                    payload["model"]["variant"] = variant_id.strip()
-            else:
-                payload["model"] = {
-                    "modelID": model.strip(),
-                }
+        if variant:
+            payload["variant"] = variant.strip()
 
         result = await self._request(
             "POST",
@@ -619,9 +621,17 @@ class OpenCodeClient:
             logger.info(
                 f"Question response result: question={question_id} result={result}"
             )
+            if isinstance(result, bool):
+                return result
             if isinstance(result, dict):
-                # API returns boolean true on success
-                return bool(result.get("data", result.get("success", True)))
+                # Do not turn an explicit false into success.  Depending on
+                # the server/version the boolean is returned directly or in
+                # either of these envelope fields.
+                if "data" in result:
+                    return result["data"] is True
+                if "success" in result:
+                    return result["success"] is True
+                return True
             return True
         except Exception as e:
             logger.error(
