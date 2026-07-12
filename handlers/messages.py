@@ -8,22 +8,28 @@ through here to OpenCode's HTTP API (or subprocess fallback).
 import logging
 import asyncio
 import os
+import time
+import html
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
 
-from utils.formatting import format_opencode_response, split_message, format_error
+from utils.formatting import format_opencode_response, split_message, format_error, format_tool_output, IMPORTANT_TOOLS
 from utils.security import sanitize_input
+from config import normalize_response_timeout
+from handlers.task_progress import parse_task_progress, upsert_task_progress_card
 from opencode.client import OpenCodeAPIError, OpenCodeConnectionError
 
 logger = logging.getLogger(__name__)
 
 
+_SERVER_CHECK_TTL = 60  # seconds — skip redundant health pings within this window
+
 async def ensure_server_running(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     """Ensure the OpenCode serve process is running in the correct directory.
 
-    Uses an in-memory flag inside bot_data to avoid redundant local HTTP pings.
+    Uses a TTL-cached in-memory flag inside bot_data to avoid redundant local HTTP pings.
     If the server is offline, it dynamically boots it scoped to the correct directory.
 
     Returns True if the server is running, False otherwise.
@@ -33,13 +39,26 @@ async def ensure_server_running(update: Update, context: ContextTypes.DEFAULT_TY
     oc_client = bot_data["opencode_client"]
     session_mgr = bot_data["session_manager"]
 
-    # 1. Check in-memory flag
-    if bot_data.get("server_started"):
-        return True
+    work_dir = await session_mgr.get_user_work_dir(user_id, config.opencode_work_dir)
 
-    # 2. If flag is False, check if the server is already reachable (e.g. started externally)
-    if await oc_client.is_available():
-        bot_data["server_started"] = True
+    from urllib.parse import urlparse
+    try:
+        url_parsed = urlparse(config.opencode_server_url)
+        hostname = url_parsed.hostname or "127.0.0.1"
+        port = url_parsed.port or 8080
+    except Exception:
+        hostname = "127.0.0.1"
+        port = 8080
+
+    from opencode.server import ensure_managed_server, is_managed_server_running
+
+    # 1. Check in-memory flag with TTL cache — skip HTTP ping if recently verified
+    last_check = bot_data.get("server_last_check", 0.0)
+    if (
+        bot_data.get("server_started")
+        and (time.monotonic() - last_check) < _SERVER_CHECK_TTL
+        and is_managed_server_running(work_dir, port=port, hostname=hostname)
+    ):
         return True
 
     # 3. Server is offline - lazy launch it scoped to the user's active folder
@@ -56,22 +75,9 @@ async def ensure_server_running(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             await update.effective_message.reply_text(text, parse_mode="HTML")
 
-    # Resolve last active directory for this user, falling back to default OPENCODE_WORK_DIR
-    work_dir = await session_mgr.get_user_work_dir(user_id, config.opencode_work_dir)
-
-    from urllib.parse import urlparse
-    try:
-        url_parsed = urlparse(config.opencode_server_url)
-        hostname = url_parsed.hostname or "127.0.0.1"
-        port = url_parsed.port or 8080
-    except Exception:
-        hostname = "127.0.0.1"
-        port = 8080
-
-    from opencode.server import restart_server
     logger.info(f"Lazy launching OpenCode server inside: {work_dir} on port {port}")
 
-    started = await restart_server(work_dir, port=port, hostname=hostname)
+    started = await ensure_managed_server(work_dir, port=port, hostname=hostname)
 
     if not started:
         await update_startup_status(
@@ -86,10 +92,56 @@ async def ensure_server_running(update: Update, context: ContextTypes.DEFAULT_TY
         pass
 
     bot_data["server_started"] = True
+    bot_data["server_last_check"] = time.monotonic()
     return True
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Enqueue one immutable message job and ensure one per-user drain worker."""
+    user_id = update.effective_user.id
+    text = sanitize_input(update.message.text or "")
+    states = context.bot_data.setdefault("message_worker_states", {})
+    state = states.setdefault(user_id, {"lock": asyncio.Lock(), "queue": asyncio.Queue(maxsize=32), "processing": False})
+    job = (update, text, update.message.message_id)
+    async with state["lock"]:
+        try:
+            state["queue"].put_nowait(job)
+        except asyncio.QueueFull:
+            await update.message.reply_text("⚠️ Message queue is full; please try again later.", parse_mode="HTML")
+            return
+        if state["processing"]:
+            await update.message.reply_text("📥 <i>Message queued — will be processed after the current task completes.</i>", parse_mode="HTML")
+            return
+        state["processing"] = True
+        worker = asyncio.create_task(_drain_message_queue(context, user_id, state))
+    # The Telegram handler must not own the worker: cancellation of this update
+    # must not cancel queued work.
+    return
+
+
+async def _drain_message_queue(context, user_id, state):
+    try:
+        while True:
+            async with state["lock"]:
+                try:
+                    job = state["queue"].get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+            try:
+                await _handle_message_impl(job[0], context, job[1], job[2], _from_worker=True)
+            except Exception:
+                logger.exception("Unhandled exception while processing queued message for user %s", user_id)
+    finally:
+        async with state["lock"]:
+            state["processing"] = False
+            if not state["queue"].empty():
+                state["processing"] = True
+                asyncio.create_task(_drain_message_queue(context, user_id, state))
+
+
+async def _handle_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                               queued_text=None, queued_message_id=None,
+                               _from_worker=False) -> None:
     """Handle incoming text messages by routing them to OpenCode.
 
     Flow:
@@ -102,13 +154,87 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """
     user = update.effective_user
     user_id = user.id
-    message_text = sanitize_input(update.message.text or "")
+    message_text = queued_text if queued_text is not None else sanitize_input(update.message.text or "")
 
     # ── Check if user is in the middle of adding an MCP server ───────
     mcp_state = context.user_data.get("mcp_state")
     if mcp_state:
         await handle_mcp_input(update, context, mcp_state)
         return
+
+    # ── Check if user is answering a request-scoped question ───────
+    awaiting_question = context.user_data.get("awaiting_question_answer")
+    if awaiting_question:
+        if isinstance(awaiting_question, dict):
+            short_key = awaiting_question.get("token")
+            question_version = awaiting_question.get("version")
+        else:
+            short_key = awaiting_question
+            question_version = None
+        from handlers.question_state import get
+        pending = get(context.bot_data, short_key, user_id, update.effective_chat.id)
+        
+        if pending:
+            session_id = pending["session_id"]
+            question_id = pending["question_id"]
+            oc_client = context.bot_data.get("opencode_client")
+            
+            try:
+                if not oc_client:
+                    raise RuntimeError("OpenCode client not available")
+                from handlers.question_state import apply_callback, discard, retry_markup, submission_failed
+                pending, submitted, state_error = await apply_callback(
+                    context.bot_data, short_key, user_id, update.effective_chat.id,
+                    "custom", custom=message_text, version=question_version,
+                )
+                if state_error:
+                    raise RuntimeError("Question expired or invalid")
+                if not submitted:
+                    context.user_data["awaiting_question_answer"] = short_key
+                    from handlers.question_state import render_current_question
+                    pending["rendered"] = False
+                    await render_current_question(update, context, short_key, pending)
+                    return
+                success = await oc_client.respond_to_question(session_id=session_id, question_id=question_id, answers=pending["answers"])
+                if success is not True:
+                    submission_failed(pending)
+                    # The custom prompt callback has been consumed and the
+                    # state version advanced. Replace it with the completed
+                    # version so a subsequent retry is not rejected as stale.
+                    context.user_data["awaiting_question_answer"] = {
+                        "token": short_key,
+                        "version": pending.get("version", 0),
+                    }
+                    await update.message.reply_text(
+                        "⚠️ OpenCode did not accept the answer. Please try again.",
+                        parse_mode="HTML",
+                        reply_markup=retry_markup(short_key, pending),
+                    )
+                    return
+                discard(context.bot_data, short_key)
+                context.user_data.pop("awaiting_question_answer", None)
+                
+                await update.message.reply_text(
+                    f"✅ Answer submitted: <code>{html.escape(message_text)}</code>",
+                    parse_mode="HTML"
+                )
+                return
+            except Exception as e:
+                if pending:
+                    submission_failed(pending)
+                    context.user_data["awaiting_question_answer"] = {
+                        "token": short_key,
+                        "version": pending.get("version", 0),
+                    }
+                logger.error(f"Failed to submit question answer: {e}", exc_info=True)
+                await update.message.reply_text(
+                    f"⚠️ Failed to submit answer: {e}",
+                    parse_mode="HTML",
+                    reply_markup=retry_markup(short_key, pending) if pending else None,
+                )
+                return
+        else:
+            context.user_data.pop("awaiting_question_answer", None)
 
     # ── Check if user is in the middle of adding an agent skill ──────
     skill_state = context.user_data.get("skill_state")
@@ -119,279 +245,389 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not message_text or not message_text.strip():
         return
 
-    status_msg = None
+    if _from_worker:
+        # The outer worker owns serialization; this invocation processes one job only.
+        pass
+    else:
+        # Direct callers are routed through the same queue entry point.
+        return await handle_message(update, context)
 
+    # ── Per-user worker state is owned by handle_message ───────
+    # If a previous prompt is still being processed, queue the new one
+    # instead of running it concurrently (which causes replay bugs).
     bot_data = context.bot_data
     session_mgr = bot_data["session_manager"]
-    oc_client = bot_data["opencode_client"]
+
+    # Per-user message queue to serialize processing.  The test-and-claim is
+    # deliberately one critical section: releasing the lock between these
+    # operations lets two Telegram updates both become the worker.
+    states = bot_data.setdefault("message_worker_states", {})
+    state = states.setdefault(user_id, {"lock": asyncio.Lock(), "queue": asyncio.Queue(maxsize=32), "processing": False})
+    user_queue = state["queue"]
+    async with state["lock"]:
+        if state["processing"] and not _from_worker:
+            try:
+                state["queue"].put_nowait((update, message_text, update.message.message_id))
+            except asyncio.QueueFull:
+                await update.message.reply_text("⚠️ Message queue is full; please try again later.", parse_mode="HTML")
+                return
+
+            # The already-running drain owns all subsequent work.  In
+            # particular, never create a second handler task for this user.
+            await update.message.reply_text(
+                "📥 <i>Message queued — will be processed after the current task completes.</i>",
+                parse_mode="HTML",
+            )
+            return
+
+        # Claim the persistent drain worker in the same critical section as
+        # enqueue/claim.  This is the only place a worker may be created.
+        state["processing"] = True
+
+    status_msg = None
+    status_msg_holder = None
+    sse_task = None
+    typing_task = None
+
     config = bot_data["config"]
+    oc_client = bot_data["opencode_client"]
+
+    try:
+        # Process exactly this immutable job. The outer worker pops the next job.
+        messages_to_process = [(update, message_text, update.message.message_id)]
+        while messages_to_process:
+            delivery_update, current_message, reply_to_msg_id = messages_to_process.pop(0)
+            update = delivery_update
 
     # ── 1. Ensure OpenCode server is running ────────────────
-    if not await ensure_server_running(update, context, user_id):
-        return
+            if not await ensure_server_running(update, context, user_id):
+                continue
 
-    # ── 2. Send typing indicator ──────────────────────────
-    await update.message.chat.send_action(ChatAction.TYPING)
+        # ── 2. Send typing indicator ──────────────────────────
+            await update.message.chat.send_action(ChatAction.TYPING)
 
-    # ── 3. Get or create session ──────────────────────────
-    session_id = await session_mgr.get_active_session(user_id)
+        # ── 3. Get or create session ──────────────────────────
+            session_id = await session_mgr.get_active_session(user_id)
 
-    if not session_id:
-        # Create a new OpenCode session
-        try:
-            session_id = await _create_session(oc_client, user_id, session_mgr, config)
-        except Exception as e:
-            logger.error(f"Failed to create session: {e}", exc_info=True)
-            await update.message.reply_text(
-                format_error(f"Failed to create session: {e}"),
-                parse_mode="HTML",
-            )
-            return
-
-    # ── 4. Send prompt to OpenCode ────────────────────────
-    # Check if streaming is enabled
-    is_streaming = await session_mgr.get_user_streaming(user_id, 0)
-    
-    # Send a premium dynamic phase status message to keep user informed in real-time
-    status_msg = await update.message.reply_text(
-        "🧠 <b>Thinking...</b>\n<i>Analyzing request and preparing a plan...</i>",
-        parse_mode="HTML"
-    )
-    
-    status_msg_holder = [status_msg]
-    
-    # Always spawn the SSE event stream listener so we can handle interactive permission prompts
-    # (e.g. for sensitive files like .env) even if the user has disabled regular tool-call progress.
-    sse_task = asyncio.create_task(
-        _listen_and_stream_events(
-            update=update,
-            context=context,
-            session_id=session_id,
-            server_url=config.opencode_server_url,
-            is_streaming=bool(is_streaming == 1),
-            status_msg_holder=status_msg_holder
-        )
-    )
-
-    typing_task = asyncio.create_task(
-        _keep_typing(update, config.response_timeout)
-    )
-    before_ids = set()
-    sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
-    sent_message_ids.clear()
-    session_mgr.set_session_running(user_id, True)
-    try:
-        # Fetch message IDs before sending the prompt
-        try:
-            before_messages = await oc_client.list_messages(session_id)
-            before_ids = {m.get("info", {}).get("id") for m in before_messages if m.get("info", {}).get("id")}
-        except Exception as e:
-            logger.warning(f"Failed to fetch messages before prompt: {e}")
-
-        session_info = await session_mgr.get_session_info(user_id)
-        session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
-        session_mode = (session_info or {}).get("mode", "build") or "build"
-
-        try:
-            response_text = await _send_to_opencode(
-                oc_client=oc_client,
-                session_id=session_id,
-                prompt=message_text,
-                model=session_model,
-                agent=session_mode,
-            )
-
-            if response_text is None:
-                # Session expired or was deleted/lost on the OpenCode server (e.g. server restart)
-                logger.warning(f"Session {session_id[:8]}... not found on server (returned null). Creating a new session and retrying...")
-                session_id = await _create_session(oc_client, user_id, session_mgr, config)
-                # Re-fetch model and mode for safe retry
-                session_info = await session_mgr.get_session_info(user_id)
-                session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
-                session_mode = (session_info or {}).get("mode", "build") or "build"
-                response_text = await _send_to_opencode(
-                    oc_client=oc_client,
-                    session_id=session_id,
-                    prompt=message_text,
-                    model=session_model,
-                    agent=session_mode,
-                )
-        except OpenCodeConnectionError as conn_err:
-            # Connection crashed/failed - Reset flag and self-heal!
-            logger.warning(f"Connection lost to OpenCode server: {conn_err}. Attempting to recover...")
-            bot_data["server_started"] = False
-            
-            await update.message.reply_text(
-                "⚠️ <i>Connection to OpenCode server was lost. Attempting to restart server and retry...</i>",
-                parse_mode="HTML",
-            )
-            
-            if await ensure_server_running(update, context, user_id):
-                # Server is back up - recreate session and retry message!
-                session_id = await _create_session(oc_client, user_id, session_mgr, config)
-                session_info = await session_mgr.get_session_info(user_id)
-                session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
-                session_mode = (session_info or {}).get("mode", "build") or "build"
-                
-                response_text = await _send_to_opencode(
-                    oc_client=oc_client,
-                    session_id=session_id,
-                    prompt=message_text,
-                    model=session_model,
-                    agent=session_mode,
-                )
-            else:
-                raise conn_err
-        except OpenCodeAPIError as e:
-            # Check if the session is missing on the server (404)
-            if e.status == 404:
-                logger.warning(f"Session {session_id[:8]}... not found on server (HTTP 404). Starting a new one...")
-                # Delete the deleted session from DB
+            if not session_id:
+                # Create a new OpenCode session
                 try:
-                    await session_mgr._db.execute(
-                        "DELETE FROM sessions WHERE user_id = ? AND opencode_session_id = ?",
-                        (user_id, session_id)
+                    session_id = await _create_session(oc_client, user_id, session_mgr, config)
+                except Exception as e:
+                    logger.error(f"Failed to create session: {e}", exc_info=True)
+                    await update.message.reply_text(
+                        format_error(f"Failed to create session: {e}"),
+                        parse_mode="HTML",
+                        reply_to_message_id=reply_to_msg_id,
                     )
-                    await session_mgr._db.commit()
-                except Exception:
-                    pass
-                
-                # Clear cache
-                if user_id in session_mgr._active_sessions:
-                    del session_mgr._active_sessions[user_id]
-                    
-                # Create a brand new session and retry
-                session_id = await _create_session(oc_client, user_id, session_mgr, config)
-                session_info = await session_mgr.get_session_info(user_id)
-                session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
-                session_mode = (session_info or {}).get("mode", "build") or "build"
-                
-                await update.message.reply_text(
-                    "⚠️ <i>Active session was deleted or expired on the server. Starting a fresh session...</i>",
-                    parse_mode="HTML",
-                )
-                
-                # Retry sending
-                response_text = await _send_to_opencode(
-                    oc_client=oc_client,
+                    continue
+
+        # ── 4. Send prompt to OpenCode ────────────────────────
+            # Check if streaming is enabled
+            is_streaming = await session_mgr.get_user_streaming(user_id, 0)
+
+            # Send a premium dynamic phase status message to keep user informed in real-time
+            status_msg = await update.message.reply_text(
+                "🧠 <b>Thinking...</b>\n<i>Analyzing request and preparing a plan...</i>",
+                parse_mode="HTML",
+                reply_to_message_id=reply_to_msg_id,
+            )
+
+            status_msg_holder = [status_msg]
+
+            # Always spawn the SSE event stream listener so we can handle interactive permission prompts
+            # (e.g. for sensitive files like .env) even if the user has disabled regular tool-call progress.
+            sse_task = asyncio.create_task(
+                _listen_and_stream_events(
+                    update=update,
+                    context=context,
                     session_id=session_id,
-                    prompt=message_text,
-                    model=session_model,
-                    agent=session_mode,
+                    server_url=config.opencode_server_url,
+                    is_streaming=bool(is_streaming == 1),
+                    status_msg_holder=status_msg_holder,
+                    reply_to_message_id=reply_to_msg_id,
                 )
-            else:
-                raise
+            )
 
-    except asyncio.TimeoutError:
-        await update.message.reply_text(
-            "⏰ <b>Request timed out.</b>\n\n"
-            "OpenCode took too long to respond. Try a simpler prompt or check the server.",
-            parse_mode="HTML",
-        )
-        return
-    except OpenCodeAPIError as e:
-        logger.error(f"OpenCode API error: {e}", exc_info=True)
-        await update.message.reply_text(
-            format_error(str(e)),
-            parse_mode="HTML",
-        )
-        return
-    except Exception as e:
-        logger.error(f"OpenCode error: {e}", exc_info=True)
-        await update.message.reply_text(
-            format_error(str(e)),
-            parse_mode="HTML",
-        )
-        return
-    finally:
-        session_mgr.set_session_running(user_id, False)
-        if typing_task:
-            typing_task.cancel()
-        if sse_task:
-            sse_task.cancel()
-        # Clean up by deleting the temporary live phase status message
-        if status_msg_holder and status_msg_holder[0]:
+            typing_task = asyncio.create_task(
+                _keep_typing(update, config.response_timeout)
+            )
+            # DON'T clear sent_message_ids — this causes concurrent handlers to re-send old messages.
+            # Only ADD to it; stale IDs from previous requests are harmless (they just prevent re-sending).
+            sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
+            session_mgr.set_session_running(user_id, True)
+
+            # Resolve model and mode: if user hasn't set a model, pass None to let oh-my-openagent plugin decide
+            session_model = await session_mgr.get_effective_model(user_id)
+            session_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
+
+            # Snapshot existing message IDs before sending — list_messages() returns
+            # the full session history, so we must diff to avoid replaying old replies.
+            # Include sent_message_ids from previous requests to prevent re-sending.
+            before_msg_ids: set = set(sent_message_ids)
             try:
-                await status_msg_holder[0].delete()
-            except Exception:
-                pass
-
-    # ── 4. Track the message ──────────────────────────────
-    await session_mgr.increment_message_count(user_id, prompt=message_text)
-
-    # ── 5. Format and send response ───────────────────────
-    # Fetch messages after prompt completes to get all multi-step assistant messages
-    response_texts = []
-    try:
-        after_messages = await oc_client.list_messages(session_id)
-        new_messages = [
-            m for m in after_messages
-            if m.get("info", {}).get("id") not in before_ids 
-            and m.get("info", {}).get("id") not in sent_message_ids
-            and m.get("info", {}).get("role") == "assistant"
-        ]
-        for m in new_messages:
-            parts = m.get("parts", [])
-            content_text = ""
-            if isinstance(parts, list):
-                text_parts = [
-                    p.get("text", "")
-                    for p in parts
-                    if isinstance(p, dict) and p.get("type") == "text"
-                ]
-                content_text = "".join(text_parts)
-            if content_text.strip():
-                response_texts.append(content_text)
-    except Exception as e:
-        logger.warning(f"Failed to fetch messages after prompt: {e}")
-
-    # Fallback to standard response if no intermediate texts were retrieved
-    all_responses = response_texts if response_texts else ([response_text] if response_text else [])
-
-    if not all_responses:
-        if response_text == "ABORTED":
-            return
-        # Send a user-friendly status message to prevent getting stuck silently
-        await update.message.reply_text(
-            "ℹ️ <b>OpenCode finished execution.</b>\n<i>(No conversational text response was returned)</i>",
-            parse_mode="HTML"
-        )
-        return
-
-    for resp in all_responses:
-        if not resp or resp == "ABORTED":
-            continue
-
-        # Format OpenCode output for Telegram
-        formatted = format_opencode_response(resp)
-
-        # Split into chunks if too long
-        chunks = split_message(formatted, config.max_message_length)
-
-        for i, chunk in enumerate(chunks):
-            try:
-                await update.message.reply_text(
-                    chunk,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
+                existing_msgs = await oc_client.list_messages(session_id)
+                before_msg_ids.update(
+                    m.get("info", {}).get("id")
+                    for m in existing_msgs
+                    if m.get("info", {}).get("id")
                 )
             except Exception as e:
-                # If HTML parsing fails, try sending as plain text
-                logger.warning(f"HTML parse failed for chunk {i+1}, falling back to plain text: {e}")
-                try:
-                    # Strip HTML tags for plain text fallback
-                    import re
-                    plain = re.sub(r'<[^>]+>', '', chunk)
-                    await update.message.reply_text(
-                        plain,
-                        disable_web_page_preview=True,
-                    )
-                except Exception as e2:
-                    logger.error(f"Failed to send chunk {i+1} even as plain text: {e2}")
+                logger.warning(f"Failed to snapshot pre-prompt message IDs: {e}")
 
-            # Small delay between chunks to respect rate limits
-            if i < len(chunks) - 1:
-                await asyncio.sleep(0.5)
+            sent_message_ids.update(before_msg_ids)
+
+            from opencode.session_delivery import register_session_delivery
+            chat_id = update.effective_chat.id if update.effective_chat else update.message.chat.id
+            register_session_delivery(
+                context,
+                user_id=user_id,
+                chat_id=chat_id,
+                session_id=session_id,
+                reply_to_message_id=reply_to_msg_id,
+                sent_message_ids=sent_message_ids,
+            )
+
+            try:
+                response_text = await _send_to_opencode(
+                    oc_client=oc_client,
+                    session_id=session_id,
+                    prompt=current_message,
+                    model=session_model,
+                    agent=session_mode,
+                    variant=await session_mgr.get_variant(user_id),
+                )
+
+                if response_text is None:
+                    logger.warning(f"Session {session_id[:8]}... not found on server (returned null). Creating a new session and retrying...")
+                    session_id = await _create_session(oc_client, user_id, session_mgr, config)
+                    session_model = await session_mgr.get_effective_model(user_id)
+                    session_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
+                    response_text = await _send_to_opencode(
+                        oc_client=oc_client,
+                        session_id=session_id,
+                        prompt=current_message,
+                        model=session_model,
+                        agent=session_mode,
+                        variant=await session_mgr.get_variant(user_id),
+                    )
+            except OpenCodeConnectionError as conn_err:
+                logger.warning(f"Connection lost to OpenCode server: {conn_err}. Attempting to recover...")
+                bot_data["server_started"] = False
+                
+                await update.message.reply_text(
+                    "⚠️ <i>Connection to OpenCode server was lost. Attempting to restart server and retry...</i>",
+                    parse_mode="HTML",
+                    reply_to_message_id=reply_to_msg_id,
+                )
+                
+                if await ensure_server_running(update, context, user_id):
+                    session_id = await _create_session(oc_client, user_id, session_mgr, config)
+                    session_model = await session_mgr.get_effective_model(user_id)
+                    session_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
+                    
+                    response_text = await _send_to_opencode(
+                        oc_client=oc_client,
+                        session_id=session_id,
+                        prompt=current_message,
+                        model=session_model,
+                        agent=session_mode,
+                        variant=await session_mgr.get_variant(user_id),
+                    )
+                else:
+                    raise conn_err
+            except OpenCodeAPIError as e:
+                if e.status == 404:
+                    logger.warning(f"Session {session_id[:8]}... not found on server (HTTP 404). Starting a new one...")
+                    try:
+                        await session_mgr._db.execute(
+                            "DELETE FROM sessions WHERE user_id = ? AND opencode_session_id = ?",
+                            (user_id, session_id)
+                        )
+                        await session_mgr._db.commit()
+                    except Exception:
+                        pass
+                    
+                    if user_id in session_mgr._active_sessions:
+                        del session_mgr._active_sessions[user_id]
+                    
+                    session_id = await _create_session(oc_client, user_id, session_mgr, config)
+                    session_model = await session_mgr.get_effective_model(user_id)
+                    session_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
+                    
+                    await update.message.reply_text(
+                        "⚠️ <i>Active session was deleted or expired on the server. Starting a fresh session...</i>",
+                        parse_mode="HTML",
+                        reply_to_message_id=reply_to_msg_id,
+                    )
+                    
+                    response_text = await _send_to_opencode(
+                        oc_client=oc_client,
+                        session_id=session_id,
+                        prompt=current_message,
+                        model=session_model,
+                        agent=session_mode,
+                        variant=await session_mgr.get_variant(user_id),
+                    )
+                else:
+                    raise
+
+            except asyncio.TimeoutError:
+                await update.message.reply_text(
+                    "⏰ <b>Request timed out.</b>\n\n"
+                    "OpenCode took too long to respond. Try a simpler prompt or check the server.",
+                    parse_mode="HTML",
+                    reply_to_message_id=reply_to_msg_id,
+                )
+                continue
+            except OpenCodeAPIError as e:
+                logger.error(f"OpenCode API error: {e}", exc_info=True)
+                await update.message.reply_text(
+                    format_error(str(e)),
+                    parse_mode="HTML",
+                    reply_to_message_id=reply_to_msg_id,
+                )
+                continue
+            except Exception as e:
+                logger.error(f"OpenCode error: {e}", exc_info=True)
+                await update.message.reply_text(
+                    format_error(str(e)),
+                    parse_mode="HTML",
+                    reply_to_message_id=reply_to_msg_id,
+                )
+                continue
+            finally:
+                session_mgr.set_session_running(user_id, False)
+                if typing_task:
+                    typing_task.cancel()
+                if sse_task:
+                    sse_task.cancel()
+                if status_msg_holder and status_msg_holder[0]:
+                    try:
+                        await status_msg_holder[0].delete()
+                    except Exception:
+                        pass
+
+            # Track the message
+            await session_mgr.increment_message_count(user_id, prompt=current_message)
+
+            # Fetch messages after prompt completes to get all multi-step assistant messages
+            response_texts = []
+            try:
+                after_messages = await oc_client.list_messages(session_id)
+                new_messages = [
+                    m for m in after_messages
+                    if m.get("info", {}).get("id") not in before_msg_ids
+                    and m.get("info", {}).get("id") not in sent_message_ids
+                    and m.get("info", {}).get("role") == "assistant"
+                ]
+                for m in new_messages:
+                    msg_id = m.get("info", {}).get("id")
+                    if msg_id in sent_message_ids:
+                        continue
+                    if msg_id:
+                        sent_message_ids.add(msg_id)
+                    parts = m.get("parts", [])
+                    content_text = ""
+                    error_msg = _extract_error_from_message(m)
+                    if isinstance(parts, list):
+                        text_parts = [
+                            p.get("text", "")
+                            for p in parts
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        ]
+                        content_text = "".join(text_parts)
+                    if error_msg:
+                        response_texts.append(f"❌ <b>Error:</b> {html.escape(error_msg)}")
+                    elif content_text.strip():
+                        response_texts.append(content_text)
+            except Exception as e:
+                logger.warning(f"Failed to fetch messages after prompt: {e}")
+
+            all_responses = response_texts if response_texts else ([response_text] if response_text else [])
+
+            if not all_responses:
+                if response_text and response_text.startswith("__ERROR__"):
+                    _, _, err_detail = response_text.partition("__ERROR__")
+                    err_parts = err_detail.split("__", 1)
+                    err_name = err_parts[0] if len(err_parts) > 0 else "Unknown"
+                    err_msg = err_parts[1] if len(err_parts) > 1 else err_detail
+                    await update.message.reply_text(
+                        format_error(f"{err_name}: {err_msg}"),
+                        parse_mode="HTML",
+                        reply_to_message_id=reply_to_msg_id,
+                    )
+                elif response_text == "ABORTED":
+                    pass
+                else:
+                    await update.message.reply_text(
+                        "ℹ️ <b>OpenCode finished execution.</b>\n<i>(No conversational text response was returned)</i>",
+                        parse_mode="HTML",
+                        reply_to_message_id=reply_to_msg_id,
+                    )
+                continue
+
+            for resp in all_responses:
+                if not resp or resp == "ABORTED":
+                    continue
+                if resp.startswith("__ERROR__"):
+                    _, _, err_detail = resp.partition("__ERROR__")
+                    err_parts = err_detail.split("__", 1)
+                    err_name = err_parts[0] if len(err_parts) > 0 else "Unknown"
+                    err_msg = err_parts[1] if len(err_parts) > 1 else err_detail
+                    await update.message.reply_text(
+                        format_error(f"{err_name}: {err_msg}"),
+                        parse_mode="HTML",
+                        reply_to_message_id=reply_to_msg_id,
+                    )
+                    continue
+
+                formatted = format_opencode_response(resp)
+                chunks = split_message(formatted, config.max_message_length)
+
+                for i, chunk in enumerate(chunks):
+                    try:
+                        await update.message.reply_text(
+                            chunk,
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                            reply_to_message_id=reply_to_msg_id,
+                        )
+                    except Exception as e:
+                        logger.warning(f"HTML parse failed for chunk {i+1}, falling back to plain text: {e}")
+                        try:
+                            import re
+                            plain = re.sub(r'<[^>]+>', '', chunk)
+                            await update.message.reply_text(
+                                plain,
+                                disable_web_page_preview=True,
+                                reply_to_message_id=reply_to_msg_id,
+                            )
+                        except Exception as e2:
+                            logger.error(f"Failed to send chunk {i+1} even as plain text: {e2}")
+
+                    if i < len(chunks) - 1:
+                        await asyncio.sleep(0.5)
+
+            # The outer per-user worker owns queue draining. Do not pre-drain jobs here.
+            break
+
+    except Exception as outer_e:
+        logger.error(f"Unexpected error in message processing loop: {outer_e}", exc_info=True)
+        try:
+            await update.message.reply_text(
+                format_error(str(outer_e)),
+                parse_mode="HTML",
+                reply_to_message_id=reply_to_msg_id,
+            )
+        except Exception:
+            pass
+    finally:
+        # _drain_message_queue owns the worker flag and clears it only after
+        # atomically observing an empty queue.
+        if not _from_worker:
+            async with state["lock"]:
+                state["processing"] = False
 
 
 async def _create_session(oc_client, user_id, session_mgr, config):
@@ -411,27 +647,50 @@ async def _create_session(oc_client, user_id, session_mgr, config):
     if not session_id:
         raise ValueError(f"OpenCode server response did not contain a session ID: {result}")
 
-    # Fetch user preferred model and mode, falling back to defaults
-    preferred_model = await session_mgr.get_user_preferred_model(user_id, config.opencode_model)
+    # Use user's preferred model if set; don't store the server-returned model
+    # because that's the server's default (e.g. OPENCODE_MODEL env var),
+    # not the user's choice. Storing it would cause get_effective_model() to
+    # return a non-None value, sending model param and overriding plugin defaults.
+    user_model = await session_mgr.get_effective_model(user_id) or ""
     preferred_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
 
     await session_mgr.set_active_session(
-        user_id, session_id, preferred_model, work_dir=work_dir, mode=preferred_mode
+        user_id, session_id, user_model, work_dir=work_dir, mode=preferred_mode
     )
     return session_id
 
 
-async def _send_to_opencode(oc_client, session_id, prompt, model, agent):
+async def _send_to_opencode(oc_client, session_id, prompt, model, agent, variant=None):
     """Send a prompt to OpenCode HTTP API.
 
     Returns:
         The response text from OpenCode, or None if the session does not exist.
     """
     logger.info(f"Sending to OpenCode API: session={session_id[:8]}... model={model} agent={agent}")
-    response = await oc_client.send_message(session_id, prompt, model=model, agent=agent)
+    response = await oc_client.send_message(session_id, prompt, model=model, variant=variant, agent=agent)
     if response is None:
         return None
+    if response.error_message:
+        logger.warning(f"OpenCode returned error in response: {response.error_name}: {response.error_message}")
+        return f"__ERROR__{response.error_name}__{response.error_message}"
     return response.content
+
+
+def _extract_error_from_message(msg_data: dict) -> str | None:
+    """Extract error info from a message dict returned by list_messages, if present."""
+    info = msg_data.get("info", {})
+    if not isinstance(info, dict):
+        return None
+    error_info = info.get("error")
+    if not isinstance(error_info, dict):
+        return None
+    name = error_info.get("name", "")
+    message = error_info.get("message", "")
+    if name == "MessageAbortedError":
+        return None
+    if name or message:
+        return f"{name}: {message}" if name else message
+    return None
 
 
 async def _keep_typing(update: Update, max_seconds: int = 3600) -> None:
@@ -440,11 +699,10 @@ async def _keep_typing(update: Update, max_seconds: int = 3600) -> None:
     Telegram typing indicator expires after ~5 seconds, so we
     refresh it every 4 seconds.
     """
-    # If max_seconds is 0 or less, default to 1 hour (3600 seconds)
-    limit = max_seconds if max_seconds and max_seconds > 0 else 3600
+    limit = normalize_response_timeout(max_seconds)
     try:
         elapsed = 0
-        while elapsed < limit:
+        while limit == 0 or elapsed < limit:
             await update.message.chat.send_action(ChatAction.TYPING)
             await asyncio.sleep(4)
             elapsed += 4
@@ -460,7 +718,8 @@ async def _listen_and_stream_events(
     session_id: str,
     server_url: str,
     is_streaming: bool,
-    status_msg_holder = None
+    status_msg_holder = None,
+    reply_to_message_id: int | None = None,
 ):
     """Listens to global OpenCode events via SSE and handles tool progress/permission requests.
     Includes an automatic reconnect loop with exponential back-off to prevent getting stuck.
@@ -469,12 +728,17 @@ async def _listen_and_stream_events(
     import json
     import html
     import uuid
-    import time
     import os
 
     url = f"{server_url.rstrip('/')}/global/event"
     notified_calls = set()
     completed_calls = set()
+    notified_permissions = set()
+    watched_session_ids = {session_id}
+    # OpenCode can emit an initial pending tool part before the part contains
+    # its `tool` field. Keep the name from the newer tool lifecycle events so
+    # that early progress updates do not regress to a user-visible "unknown".
+    tool_names_by_call_id = {}
     last_update_time = [0.0]
     last_status_text = ["🧠 <b>Thinking...</b>\n<i>Analyzing request and preparing a plan...</i>"]
 
@@ -497,13 +761,40 @@ async def _listen_and_stream_events(
             except Exception as e:
                 logger.debug(f"Failed to update status message: {e}")
 
+    async def refresh_watched_child_sessions():
+        """Discover child sessions before their first permission event arrives."""
+        try:
+            oc_client = context.bot_data.get("opencode_client")
+            list_children = getattr(oc_client, "list_session_children", None)
+            if not callable(list_children):
+                return
+            children = await list_children(session_id)
+            if not isinstance(children, list):
+                return
+            for child in children:
+                if not isinstance(child, dict):
+                    continue
+                child_id = (
+                    child.get("id")
+                    or child.get("sessionID")
+                    or child.get("sessionId")
+                )
+                if isinstance(child_id, str) and child_id:
+                    watched_session_ids.add(child_id)
+        except Exception as exc:
+            logger.debug("Unable to discover child sessions for permission routing: %s", exc)
+
     retry_delay = 1.0
     while True:
         try:
-            async with aiohttp.ClientSession(read_bufsize=100 * 1024 * 1024) as sse_session:
+            async with aiohttp.ClientSession(
+                read_bufsize=100 * 1024 * 1024,
+                timeout=aiohttp.ClientTimeout(total=None),
+            ) as sse_session:
                 async with sse_session.get(url, headers={"Accept": "text/event-stream"}) as resp:
                     # Connection successful, reset retry delay
                     retry_delay = 1.0
+                    await refresh_watched_child_sessions()
                     
                     async for line in resp.content:
                         line_str = line.decode('utf-8').strip()
@@ -521,19 +812,51 @@ async def _listen_and_stream_events(
                             if not isinstance(properties, dict):
                                 continue
                             
+                            event_type = payload.get("type", "")
+                            tool_properties = properties.get("tool", {})
+                            tool_session_id = ""
+                            if isinstance(tool_properties, dict):
+                                tool_session_id = (
+                                    tool_properties.get("sessionID")
+                                    or tool_properties.get("sessionId")
+                                    or tool_properties.get("session_id")
+                                    or ""
+                                )
+                            
                             event_session_id = (
                                 properties.get("sessionID")
                                 or properties.get("sessionId")
                                 or properties.get("session_id")
+                                or tool_session_id
                                 or payload.get("sessionID")
                                 or payload.get("sessionId")
                                 or payload.get("session_id")
                                 or ""
                             )
-                            if event_session_id != session_id:
+
+                            if event_type in ("question.asked", "permission.asked", "permission.updated", "message.part.updated", "message.updated"):
+                                logger.info(f"SSE event: type={event_type} session={event_session_id[:12] if event_session_id else 'NONE'} expected={session_id[:12]} props_keys={list(properties.keys())[:8]}")
+
+                            if event_session_id and event_session_id not in watched_session_ids:
                                 continue
 
                             event_type = payload.get("type", "")
+
+                            # The session.next tool events carry the name before
+                            # the corresponding message part is fully populated.
+                            if event_type == "session.next.tool.input.started":
+                                call_id = properties.get("callID", "")
+                                tool_name = properties.get("name", "")
+                                if call_id and tool_name:
+                                    tool_names_by_call_id[call_id] = str(tool_name)
+                                continue
+
+                            if event_type == "session.next.tool.called":
+                                call_id = properties.get("callID", "")
+                                tool_name = properties.get("tool", "")
+                                if call_id and tool_name:
+                                    tool_names_by_call_id[call_id] = str(tool_name)
+                                continue
 
                             # A. Handle Intermediate Assistant Message Completion (Real-time Streaming)
                             if event_type == "message.updated":
@@ -541,7 +864,47 @@ async def _listen_and_stream_events(
                                 msg_id = info.get("id")
                                 role = info.get("role")
                                 completed = info.get("time", {}).get("completed")
-                                
+                                error_info = info.get("error") if isinstance(info.get("error"), dict) else None
+
+                                # Message aborted — expire any pending questions from this message
+                                if error_info and error_info.get("name") == "MessageAbortedError":
+                                    pending_questions = context.bot_data.get("pending_questions", {})
+                                    chat_id = update.effective_chat.id if update.effective_chat else None
+                                    expired_keys = [k for k, v in pending_questions.items() if v.get("session_id") == session_id]
+                                    for ek in expired_keys:
+                                        tmsg_id = pending_questions[ek].get("telegram_msg_id")
+                                        if tmsg_id and chat_id:
+                                            try:
+                                                await context.bot.edit_message_text(
+                                                    chat_id=chat_id,
+                                                    message_id=tmsg_id,
+                                                    text="❓ <i>Question expired</i> ⏱️ — the agent timed out waiting for your answer.",
+                                                    parse_mode="HTML"
+                                                )
+                                            except Exception:
+                                                pass
+                                        del pending_questions[ek]
+                                    if expired_keys:
+                                        logger.info(f"Expired {len(expired_keys)} pending questions for aborted message {msg_id}")
+
+                                elif error_info and role == "assistant" and completed:
+                                    error_name = error_info.get("name", "Error")
+                                    error_message = error_info.get("message", str(error_info))
+                                    sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
+                                    if msg_id not in sent_message_ids:
+                                        sent_message_ids.add(msg_id)
+                                        if status_msg_holder and status_msg_holder[0]:
+                                            try:
+                                                await status_msg_holder[0].delete()
+                                            except Exception:
+                                                pass
+                                            status_msg_holder[0] = None
+                                        await update.message.reply_text(
+                                            format_error(f"{error_name}: {error_message}"),
+                                            parse_mode="HTML",
+                                            reply_to_message_id=reply_to_message_id,
+                                        )
+
                                 if role == "assistant" and completed:
                                     sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
                                     if msg_id not in sent_message_ids:
@@ -570,7 +933,6 @@ async def _listen_and_stream_events(
                                                             pass
                                                         status_msg_holder[0] = None
 
-                                                    from utils.formatting import format_opencode_response, split_message
                                                     formatted = format_opencode_response(content_text)
                                                     chunks = split_message(formatted, context.bot_data["config"].max_message_length)
                                                     for i, chunk in enumerate(chunks):
@@ -578,6 +940,7 @@ async def _listen_and_stream_events(
                                                             chunk,
                                                             parse_mode="HTML",
                                                             disable_web_page_preview=True,
+                                                            reply_to_message_id=reply_to_message_id,
                                                         )
                                                         if i < len(chunks) - 1:
                                                             await asyncio.sleep(0.5)
@@ -596,22 +959,36 @@ async def _listen_and_stream_events(
                                             logger.warning(f"Failed to stream intermediate message {msg_id}: {e}")
 
                             # B. Handle Permission Requested Popup (Always Enabled)
-                            elif event_type == "permission.asked":
+                            elif event_type in ("permission.asked", "permission.updated"):
                                 perm_id = properties.get("id") or properties.get("permissionID") or payload.get("id")
                                 perm_type = properties.get("permission") or properties.get("type") or "execute"
                                 patterns = properties.get("patterns", [])
+                                if not patterns:
+                                    pattern = properties.get("pattern")
+                                    if isinstance(pattern, list):
+                                        patterns = pattern
+                                    elif pattern:
+                                        patterns = [pattern]
 
                                 if not perm_id:
                                     logger.warning("Received permission.asked event but no permission ID was found.")
                                     continue
+
+                                # OpenCode may emit both permission.asked and
+                                # permission.updated for one request. Only send
+                                # one Telegram prompt for a permission ID.
+                                if perm_id in notified_permissions:
+                                    continue
+                                notified_permissions.add(perm_id)
 
                                 # Register pending permission in-memory lookup to avoid Telegram 64-char callback limit
                                 if "pending_permissions" not in context.bot_data:
                                     context.bot_data["pending_permissions"] = {}
 
                                 short_key = uuid.uuid4().hex[:8]
+                                permission_session_id = event_session_id or session_id
                                 context.bot_data["pending_permissions"][short_key] = {
-                                    "session_id": session_id,
+                                    "session_id": permission_session_id,
                                     "permission_id": perm_id
                                 }
 
@@ -625,6 +1002,8 @@ async def _listen_and_stream_events(
                                 if isinstance(tool_info, dict):
                                     tool_name = tool_info.get("name", "")
                                 if not tool_name:
+                                    tool_name = properties.get("title", "")
+                                if not tool_name:
                                     tool_name = perm_type
 
                                 msg = (
@@ -633,11 +1012,13 @@ async def _listen_and_stream_events(
                                     f"{patterns_text}\n\n"
                                     f"Do you want to allow this operation?"
                                 )
+                                context.bot_data["pending_permissions"][short_key]["prompt_text"] = msg
 
                                 keyboard = [
                                     [
-                                        InlineKeyboardButton("✅ Yes, Allow", callback_data=f"perm:allow:{short_key}"),
-                                        InlineKeyboardButton("❌ No, Deny", callback_data=f"perm:deny:{short_key}")
+                                        InlineKeyboardButton("✅ Allow once", callback_data=f"perm:once:{short_key}"),
+                                        InlineKeyboardButton("♾️ Allow always", callback_data=f"perm:always:{short_key}"),
+                                        InlineKeyboardButton("❌ Reject", callback_data=f"perm:reject:{short_key}")
                                     ]
                                 ]
 
@@ -647,6 +1028,29 @@ async def _listen_and_stream_events(
                                     reply_markup=InlineKeyboardMarkup(keyboard)
                                 )
 
+                            elif event_type == "question.asked":
+                                question_id = properties.get("id") or payload.get("id")
+                                event_session_id = properties.get("sessionID") or properties.get("sessionId") or ""
+                                questions_list = properties.get("questions", [])
+                                tool_info = properties.get("tool", {}) if isinstance(properties.get("tool"), dict) else {}
+
+                                if not question_id:
+                                    logger.warning("Received question.asked event but no question ID was found.")
+                                    continue
+
+                                if not isinstance(questions_list, list) or not questions_list:
+                                    logger.warning("Received question.asked event but no questions array found in properties.")
+                                    continue
+
+                                from handlers.question_state import create, render_current_question
+                                chat_id = update.effective_chat.id if update.effective_chat else None
+                                token, question_record = create(context.bot_data, update.effective_user.id, chat_id, event_session_id or session_id, question_id, questions_list)
+
+                                if question_record.get("rendered"):
+                                    continue
+                                await render_current_question(update, context, token, question_record)
+                                continue
+
                             # B. Handle Tool Execution Progress
                             elif event_type == "message.part.updated":
                                 part = properties.get("part", {})
@@ -655,8 +1059,14 @@ async def _listen_and_stream_events(
                                 
                                 part_type = part.get("type", "")
                                 if part_type == "tool":
-                                    tool_name = part.get("tool", "unknown")
-                                    call_id = part.get("callID", "unknown")
+                                    call_id = part.get("callID", "")
+                                    part_tool_name = part.get("tool", "")
+                                    if call_id and part_tool_name:
+                                        tool_names_by_call_id[call_id] = str(part_tool_name)
+                                    tool_name = str(
+                                        part_tool_name
+                                        or tool_names_by_call_id.get(call_id, "")
+                                    )
                                     state = part.get("state", {})
                                     if not isinstance(state, dict):
                                         continue
@@ -668,71 +1078,275 @@ async def _listen_and_stream_events(
                                     if not isinstance(metadata, dict):
                                         metadata = {}
 
+                                    # A task tool creates a child session. Add it
+                                    # immediately so its permission events are
+                                    # accepted even before /children is refreshed.
+                                    if tool_name == "task":
+                                        child_session_id = (
+                                            metadata.get("sessionId")
+                                            or metadata.get("sessionID")
+                                        )
+                                        if isinstance(child_session_id, str) and child_session_id:
+                                            watched_session_ids.add(child_session_id)
+
+                                    if tool_name == "task" and not is_streaming:
+                                        task_event = parse_task_progress(part, session_id)
+                                        if task_event is not None:
+                                            await upsert_task_progress_card(
+                                                update.message,
+                                                context,
+                                                task_event,
+                                                reply_to_message_id,
+                                            )
+
                                     # ── 1. Update In-Place Status Message (Always Active) ──
                                     if status in ("pending", "running") and status_msg_holder and status_msg_holder[0]:
-                                        status_text = ""
-                                        if tool_name == "bash":
-                                            cmd = input_data.get("command") or input_data.get("content") or ""
-                                            cmd_truncated = truncate(cmd, 60)
-                                            status_text = f"💻 <b>Running shell command...</b>\n<code>{html.escape(cmd_truncated)}</code>"
-                                        elif tool_name in ("edit", "write", "save"):
-                                            path = input_data.get("path") or input_data.get("target") or input_data.get("filepath") or ""
-                                            path_truncated = truncate(os.path.basename(path) if path else "", 60)
-                                            status_text = f"📝 <b>Modifying file...</b>\n<code>{html.escape(path_truncated)}</code>"
-                                        elif tool_name in ("read", "view", "show"):
-                                            path = input_data.get("path") or input_data.get("target") or input_data.get("filepath") or ""
-                                            path_truncated = truncate(os.path.basename(path) if path else "", 60)
-                                            status_text = f"🔍 <b>Reading file...</b>\n<code>{html.escape(path_truncated)}</code>"
-                                        elif tool_name in ("webfetch", "websearch", "search"):
-                                            query = input_data.get("query") or input_data.get("url") or ""
-                                            query_truncated = truncate(query, 60)
-                                            status_text = f"🌐 <b>Searching web...</b>\n<code>{html.escape(query_truncated)}</code>"
+                                        if status == "pending" and not (isinstance(input_data, dict) and input_data):
+                                            if tool_name:
+                                                status_text = f"⚙️ <b>Preparing tool <code>{html.escape(tool_name)}</code>...</b>"
+                                            else:
+                                                status_text = "⚙️ <b>Preparing tool...</b>"
                                         else:
-                                            status_text = f"⚙️ <b>Executing tool <code>{html.escape(tool_name)}</code>...</b>"
+                                            status_text = ""
+                                            if tool_name == "bash":
+                                                cmd = input_data.get("command") or input_data.get("content") or ""
+                                                cmd_truncated = truncate(cmd, 60)
+                                                status_text = f"💻 <b>Running shell command...</b>\n<code>{html.escape(cmd_truncated)}</code>"
+                                            elif tool_name in ("edit", "write", "save"):
+                                                path = input_data.get("path") or input_data.get("target") or input_data.get("filePath") or input_data.get("filepath") or ""
+                                                path_truncated = truncate(os.path.basename(path) if path else "", 60)
+                                                status_text = f"📝 <b>Modifying file...</b>\n<code>{html.escape(path_truncated)}</code>"
+                                            elif tool_name in ("read", "view", "show"):
+                                                path = input_data.get("filePath") or input_data.get("path") or input_data.get("target") or input_data.get("filepath") or ""
+                                                path_truncated = truncate(os.path.basename(path) if path else "", 60)
+                                                status_text = f"🔍 <b>Reading file...</b>\n<code>{html.escape(path_truncated)}</code>"
+                                            elif tool_name in ("webfetch", "websearch", "search"):
+                                                query = input_data.get("query") or input_data.get("url") or ""
+                                                query_truncated = truncate(query, 60)
+                                                status_text = f"🌐 <b>Searching web...</b>\n<code>{html.escape(query_truncated)}</code>"
+                                            elif tool_name == "question":
+                                                status_text = "❓ <b>Waiting for your answer...</b>"
+                                            else:
+                                                if isinstance(input_data, dict) and input_data:
+                                                    param_parts = []
+                                                    for k, v in input_data.items():
+                                                        v_str = str(v)
+                                                        if len(v_str) > 80:
+                                                            v_str = v_str[:77] + "..."
+                                                        param_parts.append(f"<code>{html.escape(k)}</code>: {html.escape(v_str)}")
+                                                        if len(param_parts) >= 3:
+                                                            break
+                                                    params_summary = " | ".join(param_parts)
+                                                    status_text = f"⚙️ <b>Executing tool <code>{html.escape(tool_name)}</code>...</b>\n{params_summary}"
+                                                else:
+                                                    status_text = f"⚙️ <b>Executing tool <code>{html.escape(tool_name)}</code>...</b>"
                                         
                                         await update_status(status_text)
 
-                                    # ── 2. Stream Full Tool Logs (Only if is_streaming is True) ──
+                                    # ── 1b. Handle Question Tool (Always Active) ──
+                                    if tool_name == "question":
+                                        # Question expired / aborted — update Telegram message
+                                        if status == "error" and call_id in completed_calls:
+                                            pending_questions = context.bot_data.get("pending_questions", {})
+                                            expired_keys = [
+                                                k for k, v in pending_questions.items()
+                                                if v.get("call_id") == call_id or v.get("question_id") == call_id
+                                            ]
+                                            chat_id = update.effective_chat.id if update.effective_chat else None
+                                            for ek in expired_keys:
+                                                if ek in pending_questions:
+                                                    tmsg_id = pending_questions[ek].get("telegram_msg_id")
+                                                    if tmsg_id and chat_id:
+                                                        try:
+                                                            await context.bot.edit_message_text(
+                                                                chat_id=chat_id,
+                                                                message_id=tmsg_id,
+                                                                text="❓ <i>Question expired</i> ⏱️ — the agent timed out waiting for your answer.",
+                                                                parse_mode="HTML"
+                                                            )
+                                                        except Exception:
+                                                            pass
+                                                    del pending_questions[ek]
+
+                                        # New question — normalize every ingress through the request state machine.
+                                        if status in ("pending", "running") and call_id not in notified_calls:
+                                            notified_calls.add(call_id)
+                                            completed_calls.add(call_id)
+
+                                            if not isinstance(input_data, dict):
+                                                continue
+
+                                            questions_list = input_data.get("questions", [])
+                                            if not isinstance(questions_list, list) or not questions_list:
+                                                continue
+
+                                            from handlers.question_state import create, render_current_question
+                                            request_id = (input_data.get("id") or input_data.get("questionID") or
+                                                          input_data.get("questionId"))
+                                            if not request_id:
+                                                logger.debug("Deferring question tool without a request ID: %s", call_id)
+                                                continue
+                                            token, record = create(
+                                                context.bot_data, update.effective_user.id,
+                                                update.effective_chat.id if update.effective_chat else None,
+                                                session_id, request_id, questions_list,
+                                            )
+                                            if not record.get("rendered"):
+                                                await render_current_question(update, context, token, record)
+                                            continue
+                                            for q_item in []:  # legacy renderer intentionally unreachable
+                                                q_header = q_item.get("header", "")
+                                                q_text = q_item.get("question", "")
+                                                q_options = q_item.get("options", [])
+                                                q_multiple = q_item.get("multiple", False)
+
+                                                if not q_text:
+                                                    continue
+
+                                                if "pending_questions" not in context.bot_data:
+                                                    context.bot_data["pending_questions"] = {}
+
+                                                # Try to find existing question_id from a prior question.asked event
+                                                existing_qid = None
+                                                for v in context.bot_data["pending_questions"].values():
+                                                    if v.get("call_id") == call_id and v.get("question_id"):
+                                                        existing_qid = v["question_id"]
+                                                        break
+
+                                                question_key = uuid.uuid4().hex[:8]
+                                                context.bot_data["pending_questions"][question_key] = {
+                                                    "session_id": session_id,
+                                                    "call_id": call_id,
+                                                    "question_id": existing_qid or call_id,
+                                                    "chat_id": update.effective_chat.id if update.effective_chat else None,
+                                                }
+
+                                                header_prefix = f"<b>{html.escape(q_header)}</b>\n\n" if q_header else ""
+                                                msg = f"❓ {header_prefix}{html.escape(q_text)}"
+                                                if q_multiple:
+                                                    msg += "\n\n<i>You may select multiple options.</i>"
+                                                msg += "\n\n⚠️ <i>Please answer quickly — the question times out after ~30 seconds.</i>"
+
+                                                keyboard = []
+                                                MAX_Q_OPTIONS = 10
+                                                display_options = q_options[:MAX_Q_OPTIONS] if isinstance(q_options, list) else []
+
+                                                for idx, opt in enumerate(display_options):
+                                                    if isinstance(opt, dict):
+                                                        label = opt.get("label", f"Option {idx+1}")
+                                                        value = opt.get("value", label)
+                                                        desc = opt.get("description", "")
+                                                        display_label = f"{label[:50]}"
+                                                        if desc and len(label) + len(desc) < 55:
+                                                            display_label = f"{label[:30]} — {desc[:20]}"
+                                                        cb_value = value[:40]
+                                                    else:
+                                                        display_label = str(opt)[:50]
+                                                        cb_value = display_label
+
+                                                    keyboard.append([InlineKeyboardButton(
+                                                        display_label,
+                                                        callback_data=f"question:{question_key}:0:o:{idx}"
+                                                    )])
+
+                                                if isinstance(q_options, list) and len(q_options) > MAX_Q_OPTIONS:
+                                                    msg += f"\n\n<i>(Showing {MAX_Q_OPTIONS} of {len(q_options)} options)</i>"
+
+                                                keyboard.append([InlineKeyboardButton(
+                                                    "✏️ Type custom answer",
+                                                    callback_data=f"question:{question_key}:0:custom"
+                                                )])
+
+                                                try:
+                                                    chunks = split_message(msg, context.bot_data["config"].max_message_length)
+                                                    for chunk in chunks[:-1]:
+                                                        await update.message.reply_text(chunk, parse_mode="HTML")
+                                                    sent_msg = await update.message.reply_text(
+                                                        chunks[-1],
+                                                        parse_mode="HTML",
+                                                        reply_markup=InlineKeyboardMarkup(keyboard)
+                                                    )
+                                                    context.bot_data["pending_questions"][question_key]["telegram_msg_id"] = sent_msg.message_id
+                                                except Exception as e:
+                                                    logger.error(f"Failed to send question prompt: {e}")
+                                                    try:
+                                                        fallback = f"❓ {html.escape(q_text)}\n\n<i>Please reply with your answer.</i>"
+                                                        await update.message.reply_text(fallback, parse_mode="HTML")
+                                                        context.user_data["awaiting_question_answer"] = question_key
+                                                    except Exception:
+                                                        pass
+
+                                    # ── 2. Tool Output Handling ──
+
+                                    # 2a. Always show custom-formatted output for important tools
+                                    if status == "completed" and call_id not in completed_calls:
+                                        if tool_name in IMPORTANT_TOOLS:
+                                            formatted = format_tool_output(tool_name, input_data, output_data)
+                                            if formatted:
+                                                completed_calls.add(call_id)
+                                                await update.message.reply_text(formatted, parse_mode="HTML", reply_to_message_id=reply_to_message_id)
+
+                                    # 2b. Stream Full Tool Logs (Only if is_streaming is True)
                                     if is_streaming:
                                         # 1. Tool Call Started / Running
                                         if status in ("pending", "running") and call_id not in notified_calls:
-                                            notified_calls.add(call_id)
-                                            
-                                            desc = input_data.get("description", "") if isinstance(input_data, dict) else ""
-                                            desc_text = f" — <i>\"{html.escape(desc)}\"</i>" if desc else ""
-                                            
-                                            # Format arguments
-                                            arg_lines = []
-                                            if isinstance(input_data, dict):
-                                                for k, v in input_data.items():
-                                                    if k not in ("description", "content"):
-                                                        arg_lines.append(f"<b>{html.escape(str(k))}:</b> {html.escape(truncate(str(v)))}")
-                                            args_text = "\n".join(arg_lines)
-                                            
-                                            msg = (
-                                                f"🛠️ <b>Calling Tool <code>{html.escape(tool_name)}</code></b>{desc_text}\n"
-                                            )
-                                            if args_text:
-                                                msg += f"{args_text}\n"
+                                            if status == "pending" and not (isinstance(input_data, dict) and input_data):
+                                                pass
+                                            else:
+                                                notified_calls.add(call_id)
                                                 
-                                            await update.message.reply_text(msg, parse_mode="HTML")
+                                                if tool_name == "bash":
+                                                    cmd = input_data.get("command") or input_data.get("content") or ""
+                                                    msg = f"💻 <b>Running shell command...</b>\n<code>{html.escape(truncate(cmd, 60))}</code>"
+                                                elif tool_name in ("edit", "write", "save"):
+                                                    path = input_data.get("path") or input_data.get("target") or input_data.get("filePath") or input_data.get("filepath") or ""
+                                                    msg = f"📝 <b>Modifying file...</b> <code>{html.escape(truncate(os.path.basename(path) if path else '', 60))}</code>"
+                                                elif tool_name in ("read", "view", "show"):
+                                                    path = input_data.get("filePath") or input_data.get("path") or input_data.get("target") or input_data.get("filepath") or ""
+                                                    msg = f"🔍 <b>Reading file...</b> <code>{html.escape(truncate(os.path.basename(path) if path else '', 60))}</code>"
+                                                elif tool_name in ("webfetch", "websearch", "search"):
+                                                    query = input_data.get("query") or input_data.get("url") or ""
+                                                    msg = f"🌐 <b>Searching web...</b> <code>{html.escape(truncate(query, 60))}</code>"
+                                                elif tool_name == "question":
+                                                    msg = "❓ <b>Asking a question...</b>"
+                                                else:
+                                                    msg = f"🛠️ <b>Calling Tool <code>{html.escape(tool_name)}</code></b>"
+                                                
+                                                if isinstance(input_data, dict):
+                                                    params = {k: v for k, v in input_data.items() if k != "description"}
+                                                    
+                                                    if params:
+                                                        msg += "\n\n<b>Parameters:</b>\n"
+                                                        for k, v in params.items():
+                                                            v_str = str(v)
+                                                            if len(v_str) > 100:
+                                                                v_display = f"{v_str[:100]}... ({len(v_str)} chars)"
+                                                            else:
+                                                                v_display = v_str
+                                                            msg += f"  • <code>{html.escape(k)}</code>: {html.escape(v_display)}\n"
+                                                
+                                                await update.message.reply_text(msg, parse_mode="HTML", reply_to_message_id=reply_to_message_id)
 
                                         # 2. Tool Completed
                                         elif status == "completed" and call_id not in completed_calls:
                                             completed_calls.add(call_id)
-                                            
-                                            exit_code = metadata.get("exit", 0)
-                                            output_cleaned = truncate(str(output_data))
-                                            
-                                            msg = (
-                                                f"✅ <b>Tool <code>{html.escape(tool_name)}</code> Completed</b> (Exit <code>{exit_code}</code>)\n"
-                                            )
-                                            if output_cleaned.strip():
-                                                msg += f"<pre>{html.escape(output_cleaned)}</pre>"
+
+                                            formatted = format_tool_output(tool_name, input_data, output_data)
+                                            if formatted:
+                                                await update.message.reply_text(formatted, parse_mode="HTML", reply_to_message_id=reply_to_message_id)
                                             else:
-                                                msg += f"<i>(No output returned)</i>"
-                                                
-                                            await update.message.reply_text(msg, parse_mode="HTML")
+                                                exit_code = metadata.get("exit", 0)
+                                                output_cleaned = truncate(str(output_data))
+
+                                                msg = (
+                                                    f"✅ <b>Tool <code>{html.escape(tool_name)}</code> Completed</b> (Exit <code>{exit_code}</code>)\n"
+                                                )
+                                                if output_cleaned.strip():
+                                                    msg += f"<pre>{html.escape(output_cleaned)}</pre>"
+                                                else:
+                                                    msg += f"<i>(No output returned)</i>"
+                                                    
+                                                await update.message.reply_text(msg, parse_mode="HTML", reply_to_message_id=reply_to_message_id)
 
                                         # 3. Tool Failed
                                         elif status in ("failed", "error") and call_id not in completed_calls:
@@ -748,7 +1362,7 @@ async def _listen_and_stream_events(
                                             else:
                                                 msg += f"<i>(No error description returned)</i>"
                                                 
-                                            await update.message.reply_text(msg, parse_mode="HTML")
+                                            await update.message.reply_text(msg, parse_mode="HTML", reply_to_message_id=reply_to_message_id)
 
                         except Exception as e:
                             logger.debug(f"Error parsing SSE event in listener: {e}")
@@ -757,8 +1371,66 @@ async def _listen_and_stream_events(
             logger.debug("SSE streaming task listener cancelled by parent task.")
             break
         except Exception as e:
-            err_name = e or type(e).__name__
+            err_name = str(e) or type(e).__name__
             logger.warning(f"Error in SSE streaming task listener: {err_name}. Reconnecting in {retry_delay}s...")
+
+            # Poll for missed question/abort events while SSE was down
+            try:
+                oc_client = context.bot_data["opencode_client"]
+                messages = await oc_client.list_messages(session_id)
+                for msg_data in messages:
+                    info = msg_data.get("info", {}) if isinstance(msg_data, dict) else {}
+                    if not isinstance(info, dict):
+                        continue
+                    msg_error = info.get("error")
+                    if isinstance(msg_error, dict) and msg_error.get("name") == "MessageAbortedError":
+                        # This message was aborted — expire any related pending questions
+                        pending_questions = context.bot_data.get("pending_questions", {})
+                        chat_id = update.effective_chat.id if update.effective_chat else None
+                        expired_keys = [k for k, v in pending_questions.items() if v.get("session_id") == session_id]
+                        for ek in expired_keys:
+                            tmsg_id = pending_questions[ek].get("telegram_msg_id")
+                            if tmsg_id and chat_id:
+                                try:
+                                    await context.bot.edit_message_text(
+                                        chat_id=chat_id,
+                                        message_id=tmsg_id,
+                                        text="❓ <i>Question expired</i> ⏱️ — the agent timed out while SSE was disconnected.",
+                                        parse_mode="HTML"
+                                    )
+                                except Exception:
+                                    pass
+                            del pending_questions[ek]
+
+                    # Check for still-pending question tools that SSE might have missed
+                    parts = msg_data.get("parts", []) if isinstance(msg_data, dict) else []
+                    for part in parts:
+                        if not isinstance(part, dict):
+                            continue
+                        if part.get("type") == "tool" and part.get("tool") == "question":
+                            state = part.get("state", {})
+                            if not isinstance(state, dict):
+                                continue
+                            q_call_id = part.get("callID", "")
+                            q_status = state.get("status", "")
+                            if q_status in ("pending", "running") and q_call_id not in notified_calls:
+                                # Found a pending question that SSE missed — render it
+                                input_data = state.get("input", {})
+                                if isinstance(input_data, dict):
+                                    questions_list = input_data.get("questions", [])
+                                    if isinstance(questions_list, list):
+                                        request_id = input_data.get("id") or input_data.get("questionID") or input_data.get("questionId")
+                                        if request_id:
+                                            from handlers.question_state import create, render_current_question
+                                            token, record = create(context.bot_data, update.effective_user.id,
+                                                update.effective_chat.id if update.effective_chat else None,
+                                                session_id, request_id, questions_list)
+                                            notified_calls.add(q_call_id)
+                                            if not record.get("rendered"):
+                                                await render_current_question(update, context, token, record)
+            except Exception as poll_err:
+                logger.warning(f"Failed to poll for missed events during SSE reconnect: {poll_err}")
+
             try:
                 await asyncio.sleep(retry_delay)
             except asyncio.CancelledError:
@@ -912,7 +1584,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     config = bot_data["config"]
 
     import uuid
-    import time
 
     # 1. Extract file metadata
     if document:
@@ -1033,7 +1704,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 session_id=session_id,
                 server_url=config.opencode_server_url,
                 is_streaming=bool(is_streaming == 1),
-                status_msg_holder=status_msg_holder
+                status_msg_holder=status_msg_holder,
+                reply_to_message_id=update.message.message_id,
             )
         )
 
@@ -1043,12 +1715,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         before_ids = set()
         sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
-        sent_message_ids.clear()
         session_mgr.set_session_running(user_id, True)
         try:
-            session_info = await session_mgr.get_session_info(user_id)
-            session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
-            session_mode = (session_info or {}).get("mode", "build") or "build"
+            # Pass None if user hasn't set a model, letting oh-my-openagent plugin decide
+            session_model = await session_mgr.get_effective_model(user_id)
+            session_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
 
             # Fetch message IDs before sending the prompt
             try:
@@ -1057,12 +1728,26 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             except Exception as e:
                 logger.warning(f"Failed to fetch messages before document prompt: {e}")
 
+            sent_message_ids.update(before_ids)
+
+            from opencode.session_delivery import register_session_delivery
+            chat_id = update.effective_chat.id if update.effective_chat else update.message.chat.id
+            register_session_delivery(
+                context,
+                user_id=user_id,
+                chat_id=chat_id,
+                session_id=session_id,
+                reply_to_message_id=update.message.message_id,
+                sent_message_ids=sent_message_ids,
+            )
+
             response_text = await _send_to_opencode(
                 oc_client=oc_client,
                 session_id=session_id,
                 prompt=prompt_text,
                 model=session_model,
                 agent=session_mode,
+                variant=await session_mgr.get_variant(user_id),
             )
 
             # Increment count
@@ -1080,8 +1765,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     and m.get("info", {}).get("role") == "assistant"
                 ]
                 for m in new_messages:
+                    msg_id = m.get("info", {}).get("id")
+                    if msg_id in sent_message_ids:
+                        continue
+                    if msg_id:
+                        sent_message_ids.add(msg_id)
                     parts = m.get("parts", [])
                     content_text = ""
+                    error_msg = _extract_error_from_message(m)
                     if isinstance(parts, list):
                         text_parts = [
                             p.get("text", "")
@@ -1089,7 +1780,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                             if isinstance(p, dict) and p.get("type") == "text"
                         ]
                         content_text = "".join(text_parts)
-                    if content_text.strip():
+                    if error_msg:
+                        response_texts.append(f"❌ <b>Error:</b> {html.escape(error_msg)}")
+                    elif content_text.strip():
                         response_texts.append(content_text)
             except Exception as e:
                 logger.warning(f"Failed to fetch messages after document prompt: {e}")
@@ -1098,23 +1791,42 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             all_responses = response_texts if response_texts else ([response_text] if response_text else [])
 
             if not all_responses:
-                if response_text == "ABORTED":
-                    return
-                # Send a user-friendly status message to prevent getting stuck silently
-                await update.message.reply_text(
-                    "ℹ️ <b>OpenCode finished execution.</b>\n<i>(No conversational text response was returned)</i>",
-                    parse_mode="HTML"
-                )
+                if response_text and response_text.startswith("__ERROR__"):
+                    _, _, err_detail = response_text.partition("__ERROR__")
+                    err_parts = err_detail.split("__", 1)
+                    err_name = err_parts[0] if len(err_parts) > 0 else "Unknown"
+                    err_msg = err_parts[1] if len(err_parts) > 1 else err_detail
+                    await update.message.reply_text(
+                        format_error(f"{err_name}: {err_msg}"),
+                        parse_mode="HTML",
+                        reply_to_message_id=update.message.message_id,
+                    )
+                elif response_text == "ABORTED":
+                    pass
+                else:
+                    await update.message.reply_text(
+                        "ℹ️ <b>OpenCode finished execution.</b>\n<i>(No conversational text response was returned)</i>",
+                        parse_mode="HTML",
+                        reply_to_message_id=update.message.message_id,
+                    )
                 return
 
             for resp in all_responses:
                 if not resp or resp == "ABORTED":
                     continue
+                if resp.startswith("__ERROR__"):
+                    _, _, err_detail = resp.partition("__ERROR__")
+                    err_parts = err_detail.split("__", 1)
+                    err_name = err_parts[0] if len(err_parts) > 0 else "Unknown"
+                    err_msg = err_parts[1] if len(err_parts) > 1 else err_detail
+                    await update.message.reply_text(
+                        format_error(f"{err_name}: {err_msg}"),
+                        parse_mode="HTML",
+                        reply_to_message_id=update.message.message_id,
+                    )
+                    continue
 
-                # Format OpenCode output for Telegram
                 formatted = format_opencode_response(resp)
-
-                # Split into chunks if too long
                 chunks = split_message(formatted, config.max_message_length)
 
                 for i, chunk in enumerate(chunks):
@@ -1123,6 +1835,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                             chunk,
                             parse_mode="HTML",
                             disable_web_page_preview=True,
+                            reply_to_message_id=update.message.message_id,
                         )
                     except Exception as he:
                         import re
@@ -1130,6 +1843,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         await update.message.reply_text(
                             plain,
                             disable_web_page_preview=True,
+                            reply_to_message_id=update.message.message_id,
                         )
                     if i < len(chunks) - 1:
                         await asyncio.sleep(0.5)
@@ -1138,7 +1852,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             logger.error(f"Error analyzing uploaded file: {e}", exc_info=True)
             await update.message.reply_text(
                 format_error(str(e)),
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_to_message_id=update.message.message_id,
             )
         finally:
             session_mgr.set_session_running(user_id, False)
@@ -1322,7 +2037,14 @@ async def handle_mcp_input(update: Update, context: ContextTypes.DEFAULT_TYPE, s
         current_dir = os.path.abspath(current_dir)
         
         from utils.config_parser import add_mcp_server
-        add_mcp_server(current_dir, name, mcp_config)
+        try:
+            add_mcp_server(current_dir, name, mcp_config)
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ Could not save this MCP server configuration. Please try again.",
+                parse_mode="HTML",
+            )
+            return
         
         # Reset state immediately to avoid double-processing
         context.user_data.pop("mcp_state", None)
@@ -1369,7 +2091,15 @@ async def handle_mcp_input(update: Update, context: ContextTypes.DEFAULT_TYPE, s
         current_dir = os.path.abspath(current_dir)
         
         from utils.config_parser import add_mcp_server
-        add_mcp_server(current_dir, name, mcp_config)
+        try:
+            add_mcp_server(current_dir, name, mcp_config)
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ This MCP server configuration is invalid or already exists. "
+                "Please choose a different name or review the entered values.",
+                parse_mode="HTML",
+            )
+            return
         
         # Reset state immediately
         context.user_data.pop("mcp_state", None)
@@ -1485,4 +2215,3 @@ async def handle_skill_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
         
         await render_skills_list(update, context, user_id, current_dir)
-

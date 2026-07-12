@@ -12,11 +12,137 @@ import signal
 import subprocess
 import platform
 import shutil
+import socket
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
 _server_process: subprocess.Popen | None = None
 _server_port: int = 8080  # Default port is 8080 from .env
+_server_identity: "ManagedServerIdentity | None" = None
+_lifecycle_lock = asyncio.Lock()
+
+
+@dataclass(frozen=True)
+class ManagedServerIdentity:
+    directory: str
+    port: int
+    hostname: str
+
+
+def _server_identity_for(directory: str, port: int, hostname: str) -> ManagedServerIdentity:
+    return ManagedServerIdentity(
+        directory=os.path.abspath(directory),
+        port=port,
+        hostname=hostname,
+    )
+
+
+def is_managed_server_running(directory: str, port: int = 8080, hostname: str = "127.0.0.1") -> bool:
+    expected = _server_identity_for(directory, port, hostname)
+    return (
+        _server_identity == expected
+        and _server_process is not None
+        and _server_process.poll() is None
+    )
+
+
+async def _endpoint_is_reachable(hostname: str, port: int) -> bool:
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://{hostname}:{port}/session", timeout=aiohttp.ClientTimeout(total=1)) as resp:
+                return resp.status < 500
+    except Exception:
+        return False
+
+
+async def _wait_for_ready(hostname: str, port: int) -> bool:
+    return await _endpoint_is_reachable(hostname, port)
+
+
+def _listener_owned_by_process(process, hostname: str, port: int) -> bool:
+    """Prove the managed PID owns the listener; health alone is insufficient."""
+    # Windows has no portable stdlib equivalent, but netstat exposes the
+    # owning PID.  Require both PID and LISTENING state (health is not proof
+    # of ownership).  psutil is accepted when available as a more precise
+    # implementation.
+    if platform.system() == "Windows":
+        try:
+            import psutil
+            for conn in psutil.net_connections(kind="tcp"):
+                if conn.laddr and conn.laddr.port == port and conn.pid == process.pid and conn.status == psutil.CONN_LISTEN:
+                    return hostname in ("0.0.0.0", "::", "127.0.0.1", "localhost") or conn.laddr.ip == hostname
+            return False
+        except Exception:
+            try:
+                result = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True, text=True, timeout=2)
+                pid = str(process.pid)
+                for line in result.stdout.splitlines():
+                    fields = line.split()
+                    if len(fields) >= 5 and fields[0].upper() == "TCP" and fields[3].upper() == "LISTENING" and fields[4] == pid:
+                        local = fields[1].rsplit(":", 1)
+                        if len(local) == 2 and local[1] == str(port):
+                            return local[0] in ("0.0.0.0", "::", "127.0.0.1", hostname, "[::]")
+                return False
+            except Exception:
+                return False
+    try:
+        result = subprocess.run(
+            ["lsof", "-nP", "-a", "-p", str(process.pid), "-iTCP:%d" % port, "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode != 0:
+            return False
+        output = result.stdout
+        return (":" + str(port)) in output and (hostname in ("0.0.0.0", "::", "127.0.0.1", "localhost") or hostname in output)
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+async def ensure_managed_server(
+    directory: str,
+    port: int = 8080,
+    hostname: str = "127.0.0.1",
+    *,
+    verify_reachable: bool = True,
+) -> bool:
+    async with _lifecycle_lock:
+        if is_managed_server_running(directory, port=port, hostname=hostname):
+            if not verify_reachable or await _endpoint_is_reachable(hostname, port):
+                return True
+        return await _restart_server_unlocked(directory, port=port, hostname=hostname)
+
+
+def _kill_process_tree(pid: int) -> None:
+    """Kill a process and all its descendants (process tree).
+
+    On Unix: sends SIGTERM to the process group, then SIGKILL if needed.
+    On Windows: uses taskkill /T /F for tree kill.
+    """
+    if platform.system() == "Windows":
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                           capture_output=True, timeout=10)
+        except Exception:
+            pass
+        return
+
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        return
+
+    import time
+    time.sleep(1)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
 
 def get_opencode_binary() -> str:
     """Find the opencode binary on the system."""
@@ -34,12 +160,21 @@ async def restart_server(directory: str, port: int = 8080, hostname: str = "127.
 
     Returns True if the server came up successfully, False otherwise.
     """
-    global _server_process, _server_port
-    _server_port = port
+    async with _lifecycle_lock:
+        return await _restart_server_unlocked(directory, port=port, hostname=hostname)
 
-    # 1. Stop the existing server
-    await stop_server()
+
+async def _restart_server_unlocked(directory: str, port: int = 8080, hostname: str = "127.0.0.1") -> bool:
+    global _server_process, _server_port, _server_identity
+    _server_port = port
+    _server_identity = None
+
+    await _stop_server_unlocked()
     await asyncio.sleep(1)
+
+    if await _endpoint_is_reachable(hostname, port):
+        logger.error("Refusing to reuse unmanaged opencode server already reachable on %s:%d", hostname, port)
+        return False
 
     binary = get_opencode_binary()
     cmd = [binary, "serve", "--port", str(port), "--hostname", hostname]
@@ -67,8 +202,6 @@ async def restart_server(directory: str, port: int = 8080, hostname: str = "127.
             await asyncio.sleep(2)
             continue
 
-        # 3. Wait until the server is reachable (max 15 attempts, 1s sleep + 1s timeout)
-        import aiohttp
         for attempt in range(15):
             # Check if the process exited prematurely
             poll_code = _server_process.poll()
@@ -77,23 +210,29 @@ async def restart_server(directory: str, port: int = 8080, hostname: str = "127.
                 break
 
             await asyncio.sleep(1)
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(f"http://{hostname}:{port}/session", timeout=aiohttp.ClientTimeout(total=1)) as resp:
-                        if resp.status < 500:
-                            logger.info(f"opencode serve is up after {attempt + 1}s (pid={_server_process.pid})")
-                            return True
-            except Exception:
-                pass
+            if (await _wait_for_ready(hostname, port)
+                    and _server_process.poll() is None
+                    and _listener_owned_by_process(_server_process, hostname, port)):
+                await asyncio.sleep(0.2)
+                if _server_process.poll() is not None:
+                    logger.warning("opencode serve exited during readiness check on attempt %d", run_attempt)
+                    break
+                _server_identity = _server_identity_for(directory, port, hostname)
+                logger.info(f"opencode serve is up after {attempt + 1}s (pid={_server_process.pid})")
+                return True
 
         # Cleanup failed process
         if _server_process:
             try:
-                _server_process.terminate()
+                _kill_process_tree(_server_process.pid)
                 _server_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                _server_process.kill()
+                _server_process.wait(timeout=3)
             except Exception:
                 pass
             _server_process = None
+            _server_identity = None
 
         if run_attempt == 1:
             logger.warning("First startup attempt failed or port was busy. Retrying in 2 seconds...")
@@ -104,64 +243,29 @@ async def restart_server(directory: str, port: int = 8080, hostname: str = "127.
 
 
 async def stop_server() -> None:
-    """Stop the running opencode serve process (if any)."""
-    global _server_process
+    """Stop the running opencode serve process (if any).
+
+    Kills the entire process tree (parent + child LSP processes) to prevent
+    orphan language-server processes from lingering after workspace switches.
+    """
+    async with _lifecycle_lock:
+        await _stop_server_unlocked()
+
+
+async def _stop_server_unlocked() -> None:
+    global _server_process, _server_identity
 
     if _server_process is not None and _server_process.poll() is None:
-        logger.info(f"Stopping opencode serve (pid={_server_process.pid})")
+        pid = _server_process.pid
+        logger.info(f"Stopping opencode serve (pid={pid}) and its child processes")
         try:
-            _server_process.terminate()
+            _kill_process_tree(pid)
             try:
-                _server_process.wait(timeout=5)
+                _server_process.wait(timeout=8)
             except subprocess.TimeoutExpired:
                 _server_process.kill()
                 _server_process.wait(timeout=3)
         except Exception as e:
             logger.warning(f"Error stopping opencode serve: {e}")
         _server_process = None
-    
-    # Also kill any stray opencode serve processes on our port
-    if platform.system() == "Windows":
-        try:
-            # Query netstat to find process ID listening on the port synchronously
-            proc = subprocess.run(
-                f'netstat -ano | findstr LISTENING | findstr :{_server_port}',
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=5
-            )
-            stdout = proc.stdout
-            lines = stdout.strip().split('\n')
-            for line in lines:
-                parts = line.strip().split()
-                if len(parts) >= 5:
-                    pid = parts[-1]
-                    if pid.isdigit() and int(pid) > 0:
-                        subprocess.run(f"taskkill /F /T /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-                        logger.info(f"Killed stray Windows PID={pid} on port {_server_port}")
-        except Exception as e:
-            logger.warning(f"Failed to kill stray Windows process: {e}")
-    else:
-        # Unix lsof implementation synchronously
-        try:
-            proc = subprocess.run(
-                ["lsof", "-ti", f":{_server_port}", "-sTCP:LISTEN"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=5
-            )
-            pids = proc.stdout.strip().split()
-            for pid in pids:
-                if pid.isdigit():
-                    try:
-                        os.kill(int(pid), signal.SIGTERM)
-                        logger.info(f"Killed stray Unix PID={pid} on port {_server_port}")
-                    except ProcessLookupError:
-                        pass
-        except Exception as e:
-            logger.warning(f"Error calling lsof: {e}")
-            
-    await asyncio.sleep(0.5)
+    _server_identity = None

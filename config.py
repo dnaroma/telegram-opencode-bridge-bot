@@ -7,10 +7,22 @@ and exposes them via a validated dataclass singleton.
 
 import os
 from dataclasses import dataclass, field
-from typing import List
+from typing import Final, List
 from dotenv import load_dotenv
 
 load_dotenv()
+
+DEFAULT_RESPONSE_TIMEOUT_SECONDS: Final[int] = 300
+
+
+def normalize_response_timeout(value: int | str | None) -> int:
+    try:
+        timeout = int(value) if value is not None else DEFAULT_RESPONSE_TIMEOUT_SECONDS
+    except ValueError:
+        return DEFAULT_RESPONSE_TIMEOUT_SECONDS
+    if timeout == 0:
+        return 0
+    return timeout if timeout > 0 else DEFAULT_RESPONSE_TIMEOUT_SECONDS
 
 
 @dataclass
@@ -26,7 +38,7 @@ class Config:
         opencode_model: LLM model identifier used by OpenCode.
         opencode_work_dir: Working directory OpenCode operates in.
         max_message_length: Maximum characters per Telegram message chunk.
-        response_timeout: Seconds to wait for an OpenCode response before timing out.
+        response_timeout: Seconds to wait for an OpenCode response before timing out; 0 disables it.
         db_path: File path for the SQLite session database.
     """
 
@@ -67,7 +79,23 @@ class Config:
         default_factory=lambda: int(os.getenv('MAX_MESSAGE_LENGTH', '4000'))
     )
     response_timeout: int = field(
-        default_factory=lambda: int(os.getenv('RESPONSE_TIMEOUT', '300'))
+        default_factory=lambda: normalize_response_timeout(os.getenv('RESPONSE_TIMEOUT'))
+    )
+
+    # Webhook
+    webhook_mode: bool = field(
+        default_factory=lambda: os.getenv('WEBHOOK_MODE', 'false').lower() in ('true', '1', 'yes')
+    )
+    webhook_port: int = field(
+        default_factory=lambda: int(os.getenv('WEBHOOK_PORT', '8080'))
+    )
+    webhook_url: str = field(
+        default_factory=lambda: os.getenv('WEBHOOK_URL', '')
+    )
+    webhook_path_secret: str = field(default_factory=lambda: os.getenv('WEBHOOK_PATH_SECRET', ''))
+    telegram_webhook_secret: str = field(default_factory=lambda: os.getenv('TELEGRAM_WEBHOOK_SECRET', ''))
+    cloudflare_tunnel_token: str = field(
+        default_factory=lambda: os.getenv('CLOUDFLARE_TUNNEL_TOKEN', '')
     )
 
     # Database
@@ -79,17 +107,26 @@ class Config:
     bot_version: str = "0.1.16"
 
     def validate(self) -> None:
-        """Validate that all required configuration values are present.
-
-        Raises:
-            ValueError: If a required configuration value is missing.
-        """
         if not self.telegram_bot_token:
             raise ValueError('TELEGRAM_BOT_TOKEN is required')
         if not self.authorized_users:
             raise ValueError(
                 'AUTHORIZED_USERS is required (comma-separated Telegram user IDs)'
             )
+        if self.webhook_mode and not self.webhook_url:
+            raise ValueError(
+                'WEBHOOK_MODE requires WEBHOOK_URL (e.g. https://bot.example.com). '
+                'CLOUDFLARE_TUNNEL_TOKEN is optional for auto-starting the tunnel.'
+            )
+        if self.webhook_mode:
+            from urllib.parse import urlparse
+            parsed = urlparse(self.webhook_url)
+            if parsed.scheme != "https" or not parsed.netloc or parsed.query or parsed.fragment:
+                raise ValueError('WEBHOOK_URL must be an HTTPS origin without query or fragment')
+            if self.webhook_path_secret and len(self.webhook_path_secret) < 24:
+                raise ValueError('WEBHOOK_PATH_SECRET must be at least 24 characters')
+            if self.telegram_webhook_secret and len(self.telegram_webhook_secret) < 24:
+                raise ValueError('TELEGRAM_WEBHOOK_SECRET must be at least 24 characters')
 
 
 config = Config()

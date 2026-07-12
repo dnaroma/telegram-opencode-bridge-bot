@@ -26,9 +26,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import aiohttp
+
+from config import normalize_response_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,19 @@ class OpenCodeMessage:
     content: str
     session_id: str
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    error_name: str = ""
+    error_message: str = ""
+
+
+SessionStatus = Literal["busy", "retry", "idle"]
+
+
+@dataclass(frozen=True, slots=True)
+class SessionStatusMapResult:
+    """Normalized status-map lookup with explicit endpoint availability."""
+
+    available: bool
+    statuses: Dict[str, SessionStatus]
 
 
 # ---------------------------------------------------------------------------
@@ -104,9 +119,10 @@ class OpenCodeClient:
         max_retries: int = 3,
     ) -> None:
         self.server_url: str = server_url.rstrip("/")
-        # Set total to None to disable the timeout in aiohttp if timeout is 0 or None
-        total_timeout = timeout if timeout and timeout > 0 else None
-        self.timeout: aiohttp.ClientTimeout = aiohttp.ClientTimeout(total=total_timeout)
+        total_timeout = normalize_response_timeout(timeout)
+        self.timeout: aiohttp.ClientTimeout = aiohttp.ClientTimeout(
+            total=None if total_timeout == 0 else total_timeout
+        )
         self.max_retries: int = max_retries
         self._session: Optional[aiohttp.ClientSession] = None
 
@@ -114,6 +130,7 @@ class OpenCodeClient:
         self._auth: Optional[aiohttp.BasicAuth] = None
         if username and password:
             self._auth = aiohttp.BasicAuth(username, password)
+        self.child_session_listing_available = True
 
     # -- async context-manager support --------------------------------------
 
@@ -310,7 +327,8 @@ class OpenCodeClient:
         self,
         session_id: str,
         content: str,
-        model: Optional[str] = None,
+        model: Optional[Any] = None,
+        variant: Optional[str] = None,
         agent: Optional[str] = None,
     ) -> Optional[OpenCodeMessage]:
         """Send a prompt to an OpenCode session and return the response.
@@ -337,16 +355,24 @@ class OpenCodeClient:
             payload["agent"] = agent.strip()
 
         if model:
-            if "/" in model:
-                provider_id, model_id = model.split("/", 1)
+            if isinstance(model, dict):
+                payload["model"] = {
+                    "providerID": model.get("providerID", model.get("provider_id", "")),
+                    "modelID": model.get("modelID", model.get("model_id", "")),
+                }
+                variant = variant or model.get("variant")
+            else:
+                parts = str(model).split("/", 1)
+                if len(parts) >= 2:
+                    provider_id, model_id = parts
+                else:
+                    provider_id, model_id = "", parts[0]
                 payload["model"] = {
                     "providerID": provider_id.strip(),
                     "modelID": model_id.strip(),
                 }
-            else:
-                payload["model"] = {
-                    "modelID": model.strip(),
-                }
+        if variant:
+            payload["variant"] = variant.strip()
 
         result = await self._request(
             "POST",
@@ -360,7 +386,6 @@ class OpenCodeClient:
             return None
 
         if isinstance(result, dict):
-            # Check for abort/cancel/interrupt finish reasons
             info = result.get("info", {})
             finish_reason = ""
             if isinstance(info, dict):
@@ -374,6 +399,27 @@ class OpenCodeClient:
                     content="ABORTED",
                     session_id=session_id,
                 )
+
+            # Check for error info embedded in the response
+            if isinstance(info, dict):
+                error_info = info.get("error")
+                if isinstance(error_info, dict):
+                    error_name = error_info.get("name", "")
+                    error_message = error_info.get("message", str(error_info))
+                    if error_name == "MessageAbortedError":
+                        return OpenCodeMessage(
+                            role="assistant",
+                            content="ABORTED",
+                            session_id=session_id,
+                        )
+                    # Propagate non-abort errors (rate limit, auth, model errors, etc.)
+                    return OpenCodeMessage(
+                        role="assistant",
+                        content="",
+                        session_id=session_id,
+                        error_name=error_name,
+                        error_message=error_message,
+                    )
 
             # Extract content from the returned parts list if available
             parts = result.get("parts", [])
@@ -426,47 +472,59 @@ class OpenCodeClient:
 
     async def get_available_models(self) -> Dict[str, Any]:
         """Fetch all available models and providers from the server."""
-        session = await self._get_session()
-        url = f"{self.server_url}/provider"
-        headers = {"Accept": "application/json"}
-        
-        async with session.get(url, headers=headers) as resp:
-            if resp.status >= 400:
-                body = await resp.text()
-                raise OpenCodeAPIError(resp.status, body)
-            
-            content_type = resp.headers.get("Content-Type", "")
-            if "json" in content_type:
-                return await resp.json()
-            
-            text = await resp.text()
-            try:
-                import json
-                return json.loads(text)
-            except ValueError:
-                return {}
+        result = await self._request("GET", "/provider")
+        if isinstance(result, dict):
+            return result
+        return {}
 
     async def get_available_agents(self) -> List[Dict[str, Any]]:
         """Fetch all available agents from the server."""
-        session = await self._get_session()
-        url = f"{self.server_url}/agent"
-        headers = {"Accept": "application/json"}
-        
-        async with session.get(url, headers=headers) as resp:
-            if resp.status >= 400:
-                body = await resp.text()
-                raise OpenCodeAPIError(resp.status, body)
-            
-            content_type = resp.headers.get("Content-Type", "")
-            if "json" in content_type:
-                return await resp.json()
-            
-            text = await resp.text()
-            try:
-                import json
-                return json.loads(text)
-            except ValueError:
+        result = await self._request("GET", "/agent")
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            return result.get("agents", result.get("data", []))
+        return []
+
+    async def list_session_children(self, session_id: str) -> List[Dict[str, Any]]:
+        """List child sessions for a parent OpenCode session when supported."""
+        try:
+            result = await self._request("GET", f"/session/{session_id}/children")
+        except OpenCodeAPIError as exc:
+            if exc.status == 404:
+                self.child_session_listing_available = False
+                logger.warning("OpenCode child-session endpoint is unavailable: %s", exc)
                 return []
+            raise
+        self.child_session_listing_available = True
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            for key in ("children", "sessions", "data"):
+                value = result.get(key)
+                if isinstance(value, list):
+                    return value
+        return []
+
+    async def get_session_status_map(self) -> SessionStatusMapResult:
+        """Return normalized session statuses and endpoint availability."""
+        try:
+            result = await self._request("GET", "/session/status")
+        except OpenCodeError as exc:
+            logger.warning("OpenCode session-status endpoint is unavailable: %s", exc)
+            return SessionStatusMapResult(available=False, statuses={})
+
+        status_map: Dict[str, Any] = {}
+        if isinstance(result, dict):
+            wrapped = result.get("statuses", result.get("data"))
+            status_map = wrapped if isinstance(wrapped, dict) else result
+
+        statuses: Dict[str, SessionStatus] = {}
+        for session_id, value in status_map.items():
+            status = value.get("type") if isinstance(value, dict) else value
+            if status in ("busy", "retry", "idle"):
+                statuses[session_id] = status
+        return SessionStatusMapResult(available=True, statuses=statuses)
 
     async def abort_session(self, session_id: str) -> bool:
         """Send an abort signal to stop active model processing in a session."""
@@ -496,22 +554,18 @@ class OpenCodeClient:
         Parameters:
             session_id: The session identifier.
             permission_id: The permission request identifier.
-            response: "once" | "always" | "reject" (or legacy "allow" | "deny").
+            response: "once" | "always" | "reject".
             remember: Whether to remember this decision for future operations in this session.
 
         Returns:
             True if the server successfully recorded the response, False otherwise.
         """
-        # Map legacy/semantic allow/deny values to OpenCode's strict once/always/reject contract
         normalized = response.lower().strip()
-        if normalized == "allow":
-            normalized = "once"
-        elif normalized == "deny":
-            normalized = "reject"
+        if normalized not in ("once", "always", "reject"):
+            raise ValueError(f"Unsupported permission response: {response}")
 
         payload = {
-            "response": normalized,
-            "remember": remember,
+            "reply": normalized,
         }
         logger.info(
             f"Sending permission response: session={session_id[:8]}... perm={permission_id} action={normalized}"
@@ -519,7 +573,7 @@ class OpenCodeClient:
         try:
             result = await self._request(
                 "POST",
-                f"/session/{session_id}/permissions/{permission_id}",
+                f"/permission/{permission_id}/reply",
                 json_data=payload,
             )
             if isinstance(result, dict):
@@ -528,6 +582,60 @@ class OpenCodeClient:
         except Exception as e:
             logger.error(
                 f"Failed to respond to permission {permission_id} in session {session_id}: {e}"
+            )
+            raise
+
+    async def respond_to_question(
+        self,
+        session_id: str,
+        question_id: str,
+        answers: list[list[str]],
+    ) -> bool:
+        """Respond to a question asked by the agent.
+
+        OpenCode API: POST /api/session/{sessionID}/question/{requestID}/reply
+        Payload: { answers: [[label1, label2], [label3]] }
+          - Each inner list is the selected labels for ONE question in the request.
+          - For a single-question request with one selected option: [[selected_label]]
+
+        Parameters:
+            session_id: The session identifier.
+            question_id: The question request identifier (e.g. que_f06482ccf001...).
+            answers: List of answer rows. Each row is a list of selected label strings.
+
+        Returns:
+            True if the server successfully recorded the response, False otherwise.
+        """
+        payload = {
+            "answers": answers,
+        }
+        logger.info(
+            f"Sending question response: session={session_id[:8]}... question={question_id} answers={answers}"
+        )
+        try:
+            result = await self._request(
+                "POST",
+                f"/api/session/{session_id}/question/{question_id}/reply",
+                json_data=payload,
+            )
+            logger.info(
+                f"Question response result: question={question_id} result={result}"
+            )
+            if isinstance(result, bool):
+                return result
+            if isinstance(result, dict):
+                # Do not turn an explicit false into success.  Depending on
+                # the server/version the boolean is returned directly or in
+                # either of these envelope fields.
+                if "data" in result:
+                    return result["data"] is True
+                if "success" in result:
+                    return result["success"] is True
+                return True
+            return True
+        except Exception as e:
+            logger.error(
+                f"Failed to respond to question {question_id}: {e}"
             )
             raise
 
@@ -544,27 +652,7 @@ class OpenCodeClient:
 
     async def get_mcp_status(self) -> Any:
         """Fetch status and connectivity details of registered MCP servers from the server."""
-        session = await self._get_session()
-        url = f"{self.server_url}/mcp"
-        headers = {"Accept": "application/json"}
-        try:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status >= 400:
-                    body = await resp.text()
-                    raise OpenCodeAPIError(resp.status, body)
-                
-                content_type = resp.headers.get("Content-Type", "")
-                if "json" in content_type:
-                    return await resp.json()
-                
-                text = await resp.text()
-                try:
-                    import json
-                    return json.loads(text)
-                except ValueError:
-                    return {}
-        except Exception as e:
-            logger.error(f"Failed to fetch MCP status from server: {e}")
-            raise
-
-
+        result = await self._request("GET", "/mcp")
+        if isinstance(result, dict):
+            return result
+        return {}

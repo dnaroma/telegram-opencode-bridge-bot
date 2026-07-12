@@ -28,8 +28,16 @@ sessions.db
 *.sln
 *.swp
 
+# Build artifacts
+build/
+*.egg-info/
+dist/
+
 # OS generated files
 Thumbs.db
 db.db
 Desktop.ini
 .DS_Store
+
+# Local orchestrator progress notes
+.slim/deepwork/

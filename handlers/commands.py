@@ -8,10 +8,13 @@ Handles all slash commands: /start, /help, /new, /sessions,
 import html
 import logging
 import os
+import time
 
 from telegram import Update, BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
+
+from utils.context_usage import get_context_usage
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +68,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/delete — Permanently delete a session\n"
         "/models — List all available models (tap to change)\n"
         "/mode — Select agent mode (TUI dropdown equivalents)\n"
+        "/subagents — Show active OpenCode subagent sessions\n"
+        "/restart_opencode — Force restart OpenCode server for active workspace\n"
         "/plan — Switch to plan mode (read-only)\n"
         "/build — Switch to build mode (read, write, execute)\n"
         "/share — Share current session (get public URL)\n"
@@ -87,6 +92,9 @@ async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """Clear current session and start fresh."""
     user_id = update.effective_user.id
     session_mgr = context.bot_data["session_manager"]
+
+    from opencode.session_delivery import cancel_session_delivery
+    cancel_session_delivery(context, user_id)
 
     await session_mgr.clear_session(user_id)
 
@@ -136,7 +144,7 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         logger.warning(f"Could not fetch sessions from server: {e}")
         await update.message.reply_text(
             "⚠️ Could not reach the OpenCode server to list sessions.\n"
-            "Make sure <code>opencode serve</code> is running.",
+            "Make sure the bot-managed OpenCode server is running for the active project.",
             parse_mode="HTML",
         )
         return
@@ -183,15 +191,65 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         reverse=True,
     )
 
+    # Cache the full session list in user_data so the render helper can paginate
+    context.user_data["sessions_list"] = workspace_sessions
+
     # Lookup locally-tracked data
     refreshed_local = await session_mgr.list_user_sessions(user_id)
     local_map = {ls.get("session_id"): ls for ls in refreshed_local}
     active_sid = await session_mgr.get_active_session(user_id)
 
     folder_name = os.path.basename(current_dir) or "Root"
-    lines = [f"<b>📋 Sessions in {html.escape(folder_name)}</b>\n"]
 
-    for s in workspace_sessions:
+    context.user_data["sessions_page"] = 1
+    await render_sessions_list(
+        update, context, user_id, folder_name,
+        workspace_sessions, local_map, active_sid, page=1,
+    )
+
+
+async def render_sessions_list(
+    update_or_query, context, user_id, folder_name,
+    workspace_sessions, local_map, active_sid, page=None,
+) -> None:
+    """Render the paginated sessions list with inline keyboard navigation."""
+    from utils.formatting import format_session_info
+    import math
+
+    if page is None:
+        page = context.user_data.get("sessions_page", 1)
+    else:
+        context.user_data["sessions_page"] = page
+
+    total_sessions = len(workspace_sessions)
+    page_size = 5
+    total_pages = math.ceil(total_sessions / page_size)
+    if total_pages == 0:
+        total_pages = 1
+
+    # Clamp page
+    if page > total_pages:
+        page = total_pages
+    if page < 1:
+        page = 1
+    context.user_data["sessions_page"] = page
+
+    # Sync the stored list so callbacks can use it
+    context.user_data["sessions_list"] = workspace_sessions
+
+    start_idx = (page - 1) * page_size
+    end_idx = start_idx + page_size
+    page_sessions = workspace_sessions[start_idx:end_idx]
+
+    lines = [
+        f"<b>📋 Sessions in {html.escape(folder_name)}</b>\n",
+        f"🔢 <b>会话总数:</b> <code>{total_sessions}</code>",
+    ]
+    if total_pages > 1:
+        lines.append(f"  (Page {page}/{total_pages})")
+    lines.append("")
+
+    for s in page_sessions:
         s_id = s.get("id", "")
         s_title = s.get("title", "")
         local_info = local_map.get(s_id, {})
@@ -230,6 +288,7 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         if s_title and s_id in local_map:
             try:
+                session_mgr = context.bot_data["session_manager"]
                 await session_mgr._db.execute(
                     "UPDATE sessions SET name = ? WHERE opencode_session_id = ?",
                     (s_title, s_id)
@@ -238,23 +297,43 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             except Exception:
                 pass
 
+    # Build inline keyboard — session switch buttons for this page
     keyboard = []
-    for s in workspace_sessions:
+    for s in page_sessions:
         s_id = s.get("id", "")
         s_title = s.get("title", "") or s_id[:8]
         is_active = (s_id == active_sid)
         marker = "🔹" if is_active else "📄"
-        button_text = f"{marker} {s_title}"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"sess:{s_id}")])
+        keyboard.append([InlineKeyboardButton(f"{marker} {s_title}", callback_data=f"sess:{s_id}")])
+
+    # Pagination controls
+    if total_pages > 1:
+        nav_buttons = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"sess_page:{page - 1}"))
+        else:
+            nav_buttons.append(InlineKeyboardButton("⏹️", callback_data="noop"))
+
+        nav_buttons.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+
+        if page < total_pages:
+            nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"sess_page:{page + 1}"))
+        else:
+            nav_buttons.append(InlineKeyboardButton("⏹️", callback_data="noop"))
+        keyboard.append(nav_buttons)
 
     reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
 
     if keyboard:
-        lines.append("\n👉 <b>Tap a session below to instantly switch to it:</b>")
+        lines.append("👉 <b>Tap a session below to instantly switch to it:</b>")
     else:
-        lines.append("\n<i>Send a message to start a conversation!</i>")
+        lines.append("<i>Send a message to start a conversation!</i>")
 
-    await update.message.reply_text("\n".join(lines), reply_markup=reply_markup, parse_mode="HTML")
+    is_query = hasattr(update_or_query, "edit_message_text")
+    if is_query:
+        await update_or_query.edit_message_text("\n".join(lines), reply_markup=reply_markup, parse_mode="HTML")
+    else:
+        await update_or_query.message.reply_text("\n".join(lines), reply_markup=reply_markup, parse_mode="HTML")
 
 
 # ──────────────────────────────────────────────
@@ -292,7 +371,7 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.warning(f"Could not fetch sessions from server during delete call: {e}")
         await update.message.reply_text(
             "⚠️ Could not reach the OpenCode server to list sessions.\n"
-            "Make sure <code>opencode serve</code> is running.",
+            "Make sure the bot-managed OpenCode server is running for the active project.",
             parse_mode="HTML",
         )
         return
@@ -318,16 +397,59 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
     active_sid = await session_mgr.get_active_session(user_id)
-
     folder_name = os.path.basename(current_dir) or "Root"
+
+    context.user_data["delete_sessions_list"] = workspace_sessions
+    context.user_data["delete_sessions_page"] = 1
+    await render_delete_sessions_list(
+        update, context, user_id, folder_name,
+        workspace_sessions, active_sid, page=1,
+    )
+
+
+async def render_delete_sessions_list(
+    update_or_query, context, user_id, folder_name,
+    workspace_sessions, active_sid, page=None,
+) -> None:
+    """Render the paginated delete-sessions list with inline keyboard navigation."""
+    import math
+
+    if page is None:
+        page = context.user_data.get("delete_sessions_page", 1)
+    else:
+        context.user_data["delete_sessions_page"] = page
+
+    total_sessions = len(workspace_sessions)
+    page_size = 5
+    total_pages = math.ceil(total_sessions / page_size)
+    if total_pages == 0:
+        total_pages = 1
+
+    if page > total_pages:
+        page = total_pages
+    if page < 1:
+        page = 1
+    context.user_data["delete_sessions_page"] = page
+
+    context.user_data["delete_sessions_list"] = workspace_sessions
+
+    start_idx = (page - 1) * page_size
+    end_idx = start_idx + page_size
+    page_sessions = workspace_sessions[start_idx:end_idx]
+
     text = (
-        f"🗑️ <b>Delete Session (Workspace: {html.escape(folder_name)})</b>\n\n"
-        f"Choose a session below to permanently delete it from your local machine and the server.\n\n"
-        f"⚠️ <b>WARNING:</b> This cannot be undone!"
+        f"🗑️ <b>Delete Session (Workspace: {html.escape(folder_name)})</b>\n"
+        f"🔢 <b>会话总数:</b> <code>{total_sessions}</code>"
+    )
+    if total_pages > 1:
+        text += f"  (Page {page}/{total_pages})"
+    text += (
+        "\n\nChoose a session below to permanently delete it from your local machine and the server.\n\n"
+        "⚠️ <b>WARNING:</b> This cannot be undone!"
     )
 
     keyboard = []
-    for s in workspace_sessions:
+    for s in page_sessions:
         s_id = s.get("id", "")
         s_title = s.get("title", "") or s_id[:8]
         is_active = (s_id == active_sid)
@@ -335,8 +457,28 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         button_text = f"❌ Delete {s_title} {marker}"
         keyboard.append([InlineKeyboardButton(button_text, callback_data=f"delsess:{s_id}")])
 
+    if total_pages > 1:
+        nav_buttons = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"del_page:{page - 1}"))
+        else:
+            nav_buttons.append(InlineKeyboardButton("⏹️", callback_data="noop"))
+
+        nav_buttons.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+
+        if page < total_pages:
+            nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"del_page:{page + 1}"))
+        else:
+            nav_buttons.append(InlineKeyboardButton("⏹️", callback_data="noop"))
+        keyboard.append(nav_buttons)
+
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
+
+    is_query = hasattr(update_or_query, "edit_message_text")
+    if is_query:
+        await update_or_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
+    else:
+        await update_or_query.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
 
 
 # ──────────────────────────────────────────────
@@ -441,6 +583,8 @@ async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     pass
 
     if success:
+        from opencode.session_delivery import cancel_session_delivery
+        cancel_session_delivery(context, user_id)
         await update.message.reply_text(
             f"✅ Switched to session <code>{html.escape(resolved_id[:8])}</code>",
             parse_mode="HTML",
@@ -545,6 +689,84 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
 
 
+async def subagents_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    bot_data = context.bot_data
+    session_mgr = bot_data["session_manager"]
+    session_id = await session_mgr.get_active_session(user_id)
+    if not session_id:
+        await update.message.reply_text(
+            "📭 <b>No active session.</b> Send a message first, then use /subagents.",
+            parse_mode="HTML",
+        )
+        return
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+    oc_client = bot_data.get("opencode_client")
+    child_sessions = []
+    listing_unavailable = False
+    status_map_available = False
+    session_statuses = {}
+    try:
+        child_sessions = await oc_client.list_session_children(session_id)
+        listing_unavailable = not getattr(oc_client, "child_session_listing_available", True)
+    except AttributeError:
+        listing_unavailable = True
+    except Exception as exc:
+        listing_unavailable = True
+        logger.warning("Failed to list child sessions for %s: %s", session_id, exc)
+
+    try:
+        status_result = await oc_client.get_session_status_map()
+        status_map_available = status_result.available
+        session_statuses = status_result.statuses
+    except AttributeError:
+        status_map_available = False
+    except Exception as exc:
+        logger.warning("Failed to retrieve session statuses: %s", exc)
+
+    observer_state = None
+    for state in bot_data.get("session_delivery_states", {}).values():
+        if getattr(state, "session_id", None) == session_id:
+            observer_state = state
+            break
+
+    lines = [
+        "🤖 <b>OpenCode Subagents</b>",
+        "",
+        f"• <b>Parent:</b> <code>{html.escape(session_id[:12])}</code>",
+    ]
+    if observer_state:
+        watched = sorted(getattr(observer_state, "watched_session_ids", set()) - {session_id})
+        lines.append(f"• <b>Watcher:</b> active, aware of <code>{len(watched)}</code> child session(s)")
+    else:
+        lines.append("• <b>Watcher:</b> not active for this session yet")
+
+    if listing_unavailable:
+        lines.extend([
+            "",
+            "⚠️ Child-session listing is unavailable in this OpenCode runtime.",
+            "The bridge can still forward resumed parent messages it observes.",
+        ])
+    elif not child_sessions:
+        lines.extend(["", "📭 No child/subagent sessions are visible for this parent session."])
+    else:
+        lines.append("")
+        for child in child_sessions:
+            if not isinstance(child, dict):
+                continue
+            child_id = str(child.get("id", ""))
+            if not child_id:
+                continue
+            title = str(child.get("title") or child.get("name") or child_id[:12])
+            agent = str(child.get("agent") or child.get("agentID") or child.get("mode") or "unspecified")
+            status = session_statuses.get(child_id, "idle") if status_map_available else "unavailable"
+            lines.append(f"• <code>{html.escape(child_id[:12])}</code> {html.escape(title)}")
+            lines.append(f"  Agent: <code>{html.escape(agent)}</code> | Status: <code>{html.escape(status)}</code>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 # ──────────────────────────────────────────────
 # Command: /share
 # ──────────────────────────────────────────────
@@ -597,8 +819,26 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     oc_available = await oc_client.is_available()
     session_info = await session_mgr.get_session_info(user_id)
+    effective_model = await session_mgr.get_effective_model(user_id)
+    context_usage = None
 
-    status_text = format_status(oc_available, session_info, config.opencode_model)
+    if oc_available and session_info and session_info.get("session_id"):
+        session_id = session_info["session_id"]
+        try:
+            messages = await oc_client.list_messages(session_id)
+            providers_payload = await oc_client.get_available_models()
+            fallback_model = session_info.get("model") or effective_model
+            context_usage = get_context_usage(messages, providers_payload, fallback_model)
+        except Exception as e:
+            logger.error("Failed to fetch context usage for session %s: %s", session_id[:8], e, exc_info=True)
+
+    status_text = format_status(
+        oc_available,
+        session_info,
+        effective_model,
+        config.bot_version,
+        context_usage,
+    )
     await update.message.reply_text(status_text, parse_mode="HTML")
 
 
@@ -806,6 +1046,9 @@ async def execute_project_switch(update_or_query, context: ContextTypes.DEFAULT_
     oc_client = context.bot_data["opencode_client"]
     config = context.bot_data["config"]
 
+    from opencode.session_delivery import cancel_session_delivery
+    cancel_session_delivery(context, user_id)
+
     # Save to database
     await session_mgr.set_user_work_dir(user_id, target_path)
     
@@ -897,7 +1140,7 @@ async def execute_project_switch(update_or_query, context: ContextTypes.DEFAULT_
                 raise ValueError("Response did not contain a session ID.")
 
             # Fetch user preferred model and mode
-            preferred_model = await session_mgr.get_user_preferred_model(user_id, config.opencode_model)
+            preferred_model = await session_mgr.get_effective_model(user_id) or ""
             preferred_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
             await session_mgr.set_active_session(
                 user_id, session_id, preferred_model, work_dir=target_path, mode=preferred_mode
@@ -1182,6 +1425,8 @@ async def set_bot_commands(app) -> None:
         BotCommand("delete", "Permanently delete a session"),
         BotCommand("models", "List all available models"),
         BotCommand("mode", "Select agent mode (TUI dropdown equivalents)"),
+        BotCommand("subagents", "Show active OpenCode subagents"),
+        BotCommand("restart_opencode", "Restart OpenCode server"),
         BotCommand("plan", "Switch to plan mode (read-only)"),
         BotCommand("build", "Switch to build mode (read, write, execute)"),
         BotCommand("share", "Share current session"),
@@ -1189,6 +1434,7 @@ async def set_bot_commands(app) -> None:
         BotCommand("id", "Show your Telegram user ID"),
         BotCommand("mcps", "List configured MCP servers"),
         BotCommand("skills", "List and manage agent skills"),
+        BotCommand("ps", "Inspect OpenCode/LSP processes & kill orphans"),
     ]
     await app.bot.set_my_commands(commands)
     
@@ -1222,7 +1468,55 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     import os
-    logger.info(f"Callback query received from user {user_id}: {data}")
+    logger.info("Callback query received from authorized user %s (action=%s)", user_id, data.split(":", 1)[0])
+
+    # ── Process Kill Callbacks ──────────────────────────────────────────
+    if data.startswith("ps_kill:"):
+        import asyncio as _asyncio
+        pid_str = data[len("ps_kill:"):]
+        pids_to_kill = []
+        for pid_s in pid_str.split(","):
+            try:
+                pids_to_kill.append(int(pid_s.strip()))
+            except ValueError:
+                pass
+
+        if not pids_to_kill:
+            await query.edit_message_text("⚠️ No valid PIDs to kill.", parse_mode="HTML")
+            return
+
+        killed = []
+        failed = []
+        for pid in pids_to_kill:
+            try:
+                import signal as sig_module
+                os.kill(pid, sig_module.SIGTERM)
+                killed.append(pid)
+            except ProcessLookupError:
+                killed.append(pid)
+            except PermissionError:
+                failed.append((pid, "permission denied"))
+            except OSError as e:
+                failed.append((pid, str(e)))
+
+        await _asyncio.sleep(1)
+
+        # Force-kill any survivors
+        for pid in list(killed):
+            try:
+                os.kill(pid, sig_module.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+        result_lines = []
+        if killed:
+            result_lines.append(f"✅ <b>Killed:</b> PID {', '.join(str(p) for p in killed)}")
+        if failed:
+            for pid, reason in failed:
+                result_lines.append(f"❌ <b>Failed:</b> PID {pid} — {html.escape(reason)}")
+
+        await query.edit_message_text("\n".join(result_lines), parse_mode="HTML")
+        return
 
     # ── MCP Server Configuration Callbacks ──────────────────────────────
     if data.startswith("mcp_toggle:"):
@@ -1235,7 +1529,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         current_dir = os.path.abspath(current_dir)
         
         from utils.config_parser import toggle_mcp_server
-        toggle_mcp_server(current_dir, mcp_name, enabled)
+        try:
+            changed = toggle_mcp_server(current_dir, mcp_name, enabled)
+        except ValueError:
+            await query.edit_message_text(
+                "⚠️ This project action cannot alter inherited global MCP configuration.", parse_mode="HTML"
+            )
+            return
+
+        if not changed:
+            await query.edit_message_text(
+                f"ℹ️ MCP server <code>{html.escape(mcp_name)}</code> was not changed. "
+                "It is inherited or has no project-level configuration to toggle.",
+                parse_mode="HTML",
+            )
+            return
         
         await query.edit_message_text(
             f"🔄 <b>Toggling MCP server {html.escape(mcp_name)}...</b>\n"
@@ -1271,7 +1579,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         current_dir = os.path.abspath(current_dir)
         
         from utils.config_parser import delete_mcp_server
-        delete_mcp_server(current_dir, mcp_name)
+        try:
+            changed = delete_mcp_server(current_dir, mcp_name)
+        except ValueError:
+            await query.edit_message_text(
+                "⚠️ This project action cannot alter inherited global MCP configuration.", parse_mode="HTML"
+            )
+            return
+
+        if not changed:
+            await query.edit_message_text(
+                f"ℹ️ MCP server <code>{html.escape(mcp_name)}</code> was not deleted. "
+                "It has no project-level configuration entry (an inherited server is unchanged).",
+                parse_mode="HTML",
+            )
+            return
         
         await query.edit_message_text(
             f"🗑️ <b>Deleting MCP server {html.escape(mcp_name)}...</b>\n"
@@ -1354,7 +1676,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         current_dir = os.path.abspath(current_dir)
         
         from utils.config_parser import add_mcp_server
-        add_mcp_server(current_dir, name, mcp_config)
+        try:
+            add_mcp_server(current_dir, name, mcp_config)
+        except ValueError:
+            await query.edit_message_text(
+                "⚠️ This project action cannot alter inherited global MCP configuration.", parse_mode="HTML"
+            )
+            return
+        except Exception as e:
+            logger.error("Failed to add MCP server", exc_info=True)
+            await query.edit_message_text(
+                f"⚠️ <b>Could not add MCP server:</b> {html.escape(str(e))}", parse_mode="HTML"
+            )
+            return
         
         # Reset state immediately
         context.user_data.pop("mcp_state", None)
@@ -1595,6 +1929,29 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await render_skills_list(query, context, user_id, current_dir)
         return
 
+    # 0.5 Sessions pagination
+    elif data.startswith("sess_page:"):
+        page = int(data.split(":")[1])
+        workspace_sessions = context.user_data.get("sessions_list", [])
+        if not workspace_sessions:
+            await query.edit_message_text("⚠️ Session list expired. Use /sessions to reload.", parse_mode="HTML")
+            return
+
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        folder_name = os.path.basename(current_dir) or "Root"
+
+        refreshed_local = await session_mgr.list_user_sessions(user_id)
+        local_map = {ls.get("session_id"): ls for ls in refreshed_local}
+        active_sid = await session_mgr.get_active_session(user_id)
+
+        await render_sessions_list(
+            query, context, user_id, folder_name,
+            workspace_sessions, local_map, active_sid, page=page,
+        )
+        return
+
     # 1. Switch Session tap
     if data.startswith("sess:"):
         target_id = data[len("sess:"):]
@@ -1678,6 +2035,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                         pass
 
         if success:
+            from opencode.session_delivery import cancel_session_delivery
+            cancel_session_delivery(context, user_id)
             await query.edit_message_text(
                 f"✅ Switched to session <code>{html.escape(resolved_id[:8])}</code>",
                 parse_mode="HTML",
@@ -1687,6 +2046,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"❌ Session <code>{html.escape(resolved_id[:8])}</code> not found.",
                 parse_mode="HTML",
             )
+
+    # 1.25 Delete-sessions list pagination
+    elif data.startswith("del_page:"):
+        page = int(data.split(":")[1])
+        workspace_sessions = context.user_data.get("delete_sessions_list", [])
+        if not workspace_sessions:
+            await query.edit_message_text("⚠️ Session list expired. Use /delete to reload.", parse_mode="HTML")
+            return
+
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        folder_name = os.path.basename(current_dir) or "Root"
+        active_sid = await session_mgr.get_active_session(user_id)
+
+        await render_delete_sessions_list(
+            query, context, user_id, folder_name,
+            workspace_sessions, active_sid, page=page,
+        )
+        return
 
     # 1.3 Delete Session tap
     elif data.startswith("delsess:"):
@@ -1730,6 +2109,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # 3. If active session was deleted, clear active cache and reset
         active_sid = await session_mgr.get_active_session(user_id)
         if active_sid == resolved_id:
+            from opencode.session_delivery import cancel_session_delivery
+            cancel_session_delivery(context, user_id)
             if user_id in session_mgr._active_sessions:
                 del session_mgr._active_sessions[user_id]
             # Try to auto-resolve first remaining session or let the bot create a new one lazily
@@ -1740,11 +2121,43 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             parse_mode="HTML",
         )
 
+        # Reload the delete list so the user can continue deleting
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+
+        def _norm(p):
+            if not p:
+                return ""
+            return os.path.normcase(os.path.normpath(os.path.abspath(p)))
+
+        current_dir_norm = _norm(current_dir)
+
+        refreshed_server_sessions = []
+        try:
+            refreshed_server_sessions = await oc_client.list_sessions()
+        except Exception:
+            pass
+
+        refreshed_workspace = []
+        for s in refreshed_server_sessions:
+            if _norm(s.get("directory", "")) == current_dir_norm:
+                refreshed_workspace.append(s)
+        refreshed_workspace.sort(key=lambda s: s.get("time", {}).get("updated", 0), reverse=True)
+
+        if refreshed_workspace:
+            folder_name = os.path.basename(current_dir) or "Root"
+            new_active_sid = await session_mgr.get_active_session(user_id)
+            await render_delete_sessions_list(
+                query, context, user_id, folder_name,
+                refreshed_workspace, new_active_sid, page=1,
+            )
+
     # 1.5 Handle Sensitive Operations / Tool Permissions
     elif data.startswith("perm:"):
         parts = data.split(":")
         if len(parts) == 3:
-            action = parts[1]      # "allow" or "deny"
+            action = parts[1]      # "once", "always", or "reject"
             short_key = parts[2]   # 8-char lookup key
             
             pending_perms = bot_data.get("pending_permissions", {})
@@ -1760,7 +2173,45 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             session_id = pending["session_id"]
             permission_id = pending["permission_id"]
             
-            response_value = "once" if action == "allow" else "reject"
+            # Keep accepting callbacks from older prompts after a bot restart.
+            if action not in ("once", "always", "reject", "always_confirm", "always_cancel"):
+                await query.edit_message_text(
+                    text=f"{query.message.text}\n\n⚠️ <b>Invalid permission action.</b>",
+                    parse_mode="HTML",
+                )
+                return
+
+            if action == "always":
+                confirm_keyboard = [[
+                    InlineKeyboardButton("✅ Confirm always", callback_data=f"perm:always_confirm:{short_key}"),
+                    InlineKeyboardButton("↩️ Cancel", callback_data=f"perm:always_cancel:{short_key}"),
+                ]]
+                await query.edit_message_text(
+                    text=(
+                        f"{query.message.text}\n\n"
+                        "⚠️ <b>Confirm permanent permission</b>\n"
+                        "This will allow future matching operations in this OpenCode session without asking again."
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(confirm_keyboard),
+                )
+                return
+
+            if action == "always_cancel":
+                prompt_text = pending.get("prompt_text", query.message.text)
+                prompt_keyboard = [[
+                    InlineKeyboardButton("✅ Allow once", callback_data=f"perm:once:{short_key}"),
+                    InlineKeyboardButton("♾️ Allow always", callback_data=f"perm:always:{short_key}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"perm:reject:{short_key}"),
+                ]]
+                await query.edit_message_text(
+                    text=prompt_text,
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(prompt_keyboard),
+                )
+                return
+
+            response_value = "always" if action == "always_confirm" else action
             
             try:
                 # Call our client's respond_to_permission method
@@ -1776,7 +2227,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 
                 # Format final notification status
                 if response_value == "once":
-                    status_text = "✅ <b>Approved:</b> The agent was allowed to perform this operation."
+                    status_text = "✅ <b>Allowed once:</b> The agent was allowed to perform this operation."
+                elif response_value == "always":
+                    status_text = "♾️ <b>Always allowed:</b> Future matching operations will be allowed."
                 else:
                     status_text = "❌ <b>Rejected:</b> The agent was denied permission to perform this operation."
                 
@@ -1791,12 +2244,264 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     parse_mode="HTML"
                 )
 
+    # 1.6 Handle Question Responses
+    elif data.startswith("question:"):
+        from handlers.question_state import parse_callback, apply_callback, render_current_question, retry_markup
+        parsed = parse_callback(data)
+        if parsed:
+            short_key, version, action, option_index = parsed
+            answer = action
+            
+            pending = bot_data.get("question_callbacks", {}).get(short_key)
+            
+            if not pending:
+                await query.edit_message_text(
+                    text=f"{query.message.text}\n\n⚠️ <b>Question Expired:</b> This question is no longer valid or the bot was restarted.",
+                    parse_mode="HTML"
+                )
+                return
+            
+            if action == "custom":
+                # Do not resurrect an old prompt after the final answer has
+                # completed (or while a submission is being attempted).
+                if (
+                    pending.get("submitted") or pending.get("in_flight")
+                    or version != pending.get("version", 0)
+                    or pending.get("index", 0) >= len(pending.get("questions", []))
+                ):
+                    await query.answer("Question expired or invalid", show_alert=True)
+                    return
+                context.user_data["awaiting_question_answer"] = {
+                    "token": short_key,
+                    "version": version,
+                }
+                await query.edit_message_text(
+                    text=f"{query.message.text}\n\n✏️ <i>Please type your custom answer as a regular message.</i>",
+                    parse_mode="HTML"
+                )
+                return
+                
+            pending, submitted, state_error = await apply_callback(
+                bot_data, short_key, user_id, query.message.chat_id,
+                action, index=option_index, version=version,
+            )
+            if state_error:
+                if state_error == "custom_input":
+                    return
+                await query.answer("Question expired or invalid", show_alert=True)
+                return
+            if not submitted:
+                await query.answer("Selection updated")
+                if pending.get("index", 0) < len(pending.get("questions", [])) and action in {"option", "done"}:
+                    pending["rendered"] = False
+                    await render_current_question(query, context, short_key, pending)
+                return
+            session_id = pending["session_id"]
+            question_id = pending["question_id"]
+            chat_id = pending.get("chat_id")
+            telegram_msg_id = pending.get("telegram_msg_id")
+            
+            try:
+                # answers: [[selected_label]] — one row per question, each row is list of selected labels
+                success = await oc_client.respond_to_question(
+                    session_id=session_id,
+                    question_id=question_id,
+                    answers=pending["answers"]
+                )
+                
+                if success is not True:
+                    from handlers.question_state import submission_failed
+                    submission_failed(pending)
+                    await query.answer("OpenCode rejected the answer; please retry", show_alert=True)
+                    retry_text = (
+                        f"{query.message.text}\n\n⚠️ <b>Submission rejected:</b> "
+                        "your completed answers were preserved. Use Retry submission to try again."
+                    )
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id, message_id=telegram_msg_id,
+                            text=retry_text, parse_mode="HTML",
+                            reply_markup=retry_markup(short_key, pending),
+                        )
+                    except Exception:
+                        await query.edit_message_text(
+                            text=retry_text, parse_mode="HTML",
+                            reply_markup=retry_markup(short_key, pending),
+                        )
+                    return
+
+                from handlers.question_state import discard
+                discard(bot_data, short_key)
+                awaiting = context.user_data.get("awaiting_question_answer")
+                if (
+                    (isinstance(awaiting, dict) and awaiting.get("token") == short_key)
+                    or awaiting == short_key
+                ):
+                    context.user_data.pop("awaiting_question_answer", None)
+
+                if telegram_msg_id and chat_id:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=telegram_msg_id,
+                            text=f"{query.message.text}\n\n✅ <b>Answer Submitted:</b> <code>{html.escape(answer)}</code>\n\n<i>Agent is processing your answer...</i>",
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        await query.edit_message_text(
+                            text=f"{query.message.text}\n\n✅ <b>Answer Submitted:</b> <code>{html.escape(answer)}</code>\n\n<i>Agent is processing your answer...</i>",
+                            parse_mode="HTML"
+                        )
+                else:
+                    await query.edit_message_text(
+                        text=f"{query.message.text}\n\n✅ <b>Answer Submitted:</b> <code>{html.escape(answer)}</code>\n\n<i>Agent is processing your answer...</i>",
+                        parse_mode="HTML"
+                    )
+            except Exception as e:
+                logger.error(f"Error responding to question {question_id} in callback: {e}", exc_info=True)
+                from handlers.question_state import submission_failed
+                submission_failed(pending)
+                retry_text = (
+                    f"{query.message.text}\n\n⚠️ <b>Failed to submit:</b> "
+                    "your completed answers were preserved. Use Retry submission to try again."
+                )
+                if telegram_msg_id and chat_id:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=telegram_msg_id,
+                            text=retry_text, parse_mode="HTML",
+                            reply_markup=retry_markup(short_key, pending),
+                        )
+                    except Exception:
+                        await query.edit_message_text(
+                            text=retry_text, parse_mode="HTML",
+                            reply_markup=retry_markup(short_key, pending),
+                        )
+                else:
+                    await query.edit_message_text(
+                        text=retry_text, parse_mode="HTML",
+                        reply_markup=retry_markup(short_key, pending),
+                    )
+
     # 2. Switch Model tap
     elif data.startswith("model:"):
         new_model = data[len("model:"):]
-        await session_mgr.set_model(user_id, new_model)
+        
+        if new_model == "__auto__":
+            await session_mgr.set_model(user_id, "")
+            await query.edit_message_text(
+                f"🔄 Model set to <b>Auto</b>\n\n"
+                f"The model will be determined by the active agent mode.\n\n"
+                f"<i>Each agent (build/plan/pentester) may use a different default model.</i>",
+                parse_mode="HTML",
+            )
+        else:
+            await session_mgr.set_model(user_id, new_model)
+            await query.edit_message_text(
+                f"✅ Model changed to <code>{html.escape(new_model)}</code>\n\n"
+                f"<i>This applies to your current session.</i>",
+                parse_mode="HTML",
+            )
+
+    # 2.2.5 Model Variants Selection
+    elif data.startswith("modelvariants:"):
+        model_path = data[len("modelvariants:"):]
+        
+        try:
+            parts = model_path.split("/", 1)
+            if len(parts) != 2:
+                await query.edit_message_text("❌ Invalid model path format.")
+                return
+                
+            provider_id, model_id = parts
+            
+            models_data = await oc_client.get_available_models()
+            all_providers = models_data.get("all", [])
+            
+            target_provider = None
+            target_model = None
+            
+            for p in all_providers:
+                if p.get("id", "").lower() == provider_id.lower():
+                    target_provider = p
+                    models = p.get("models", {})
+                    target_model = models.get(model_id)
+                    break
+            
+            if not target_model:
+                await query.edit_message_text("❌ Model not found.")
+                return
+            
+            variants_raw = target_model.get("variants", {})
+            
+            if isinstance(variants_raw, dict):
+                variants = [{"id": k, "name": v.get("name", k) if isinstance(v, dict) else k} 
+                           for k, v in variants_raw.items()]
+            elif isinstance(variants_raw, list):
+                variants = variants_raw
+            else:
+                variants = []
+            
+            if not variants:
+                await query.edit_message_text("❌ No variants available for this model.")
+                return
+            
+            model_name = target_model.get("name", model_id)
+            
+            variants_keyboard = []
+            variants_keyboard.append([InlineKeyboardButton(
+                f"───【 🎛️ {model_name.upper()} VARIANTS 】───", 
+                callback_data="noop"
+            )])
+            
+            import secrets, time
+            variant_store = bot_data.setdefault("variant_callbacks", {})
+            for variant in variants:
+                if isinstance(variant, dict):
+                    variant_id = variant.get("id", "")
+                    variant_name = variant.get("name", variant_id)
+                else:
+                    variant_id = str(variant)
+                    variant_name = str(variant)
+                
+                # Include provider in the path: provider/model/variant
+                variant_path = secrets.token_urlsafe(8)
+                variant_store[variant_path] = {"user_id": user_id, "chat_id": query.message.chat_id,
+                    "provider": provider_id, "model": model_id, "variant": str(variant_id),
+                    "expires": time.monotonic() + 120}
+                
+                variants_keyboard.append([InlineKeyboardButton(
+                    f"✨ {variant_name}",
+                    callback_data=f"modelvariant:{variant_path}"
+                )])
+            
+            variants_keyboard.append([InlineKeyboardButton(
+                f"« ⬅️ Back to {provider_id.capitalize()} Models", 
+                callback_data=f"prov:{provider_id}"
+            )])
+            
+            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(variants_keyboard))
+            
+        except Exception as e:
+            logger.error(f"Failed to show variants for {model_path}: {e}", exc_info=True)
+            await query.edit_message_text(f"❌ Failed to load variants: {e}")
+
+    # 2.2.6 Model Variant Selected
+    elif data.startswith("modelvariant:"):
+        variant_path = data[len("modelvariant:"):]
+        
+        # Keep callback data short and resolve the complete selection server-side.
+        record = bot_data.get("variant_callbacks", {}).pop(variant_path, None)
+        if record and record.get("expires", 0) > time.monotonic() and record.get("user_id") == user_id and record.get("chat_id") == query.message.chat_id:
+            provider_id, model_id, variant_id = record["provider"], record["model"], record["variant"]
+            await session_mgr.set_model(user_id, f"{provider_id}/{model_id}", variant=variant_id)
+            variant_path = f"{provider_id}/{model_id}/{variant_id}"
+        else:
+            await query.answer("This selection expired", show_alert=True)
+            return
         await query.edit_message_text(
-            f"✅ Model changed to <code>{html.escape(new_model)}</code>\n\n"
+            f"✅ Model variant changed to <code>{html.escape(variant_path)}</code>\n\n"
             f"<i>This applies to your current session.</i>",
             parse_mode="HTML",
         )
@@ -1813,8 +2518,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         }
         emoji = mode_emojis.get(new_mode.lower(), "🤖")
         
+        # Check if user has a locked model
+        locked_model = await session_mgr.get_effective_model(user_id)
+        if locked_model:
+            model_info = f"Using your selected model: <code>{html.escape(locked_model)}</code>"
+        else:
+            model_info = "Using the default model for this agent"
+        
         await query.edit_message_text(
             f"{emoji} Mode changed to <b>{html.escape(new_mode)}</b>\n\n"
+            f"{model_info}\n\n"
             f"<i>OpenCode will now use the '{html.escape(new_mode)}' agent configuration.</i>",
             parse_mode="HTML",
         )
@@ -1856,13 +2569,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             sub_keyboard = []
             sub_keyboard.append([InlineKeyboardButton(f"───【 {emoji} {p_name.upper()} MODELS 】───", callback_data="noop")])
             
+            sub_keyboard.append([InlineKeyboardButton("🔄 Default (Auto) - Let agent decide", callback_data="model:__auto__")])
+            
             model_buttons = []
             for m_id, m in models.items():
                 m_name = m.get("name", m_id)
+                variants = m.get("variants", [])
                 path = f"{p_id}/{m_id}"
-                
                 display_name = m_name[:15] + "..." if len(m_name) > 18 else m_name
-                model_buttons.append(InlineKeyboardButton(f"🤖 {display_name}", callback_data=f"model:{path}"))
+                
+                has_variants = bool(variants)
+                callback_prefix = "modelvariants:" if has_variants else "model:"
+                arrow_indicator = " ▶" if has_variants else ""
+                
+                button = InlineKeyboardButton(
+                    f"🤖 {display_name}{arrow_indicator}", 
+                    callback_data=f"{callback_prefix}{path}"
+                )
+                model_buttons.append(button)
             
             for j in range(0, len(model_buttons), 2):
                 sub_keyboard.append(model_buttons[j:j+2])
@@ -2299,11 +3023,21 @@ async def render_mcps_list(update_or_query, context, user_id, current_dir, page=
             connected_servers = live_status
 
     total_mcps = len(mcp_config)
-    page_size = 6
+    page_size = 5
     total_pages = math.ceil(total_mcps / page_size)
     if total_pages == 0:
         total_pages = 1
-        
+
+    # Aggregate total tool count from live status
+    total_tools = 0
+    for _srv_name, srv_info in connected_servers.items():
+        if isinstance(srv_info, dict):
+            tools_data = srv_info.get("tools", [])
+            if isinstance(tools_data, list):
+                total_tools += len(tools_data)
+            elif isinstance(tools_data, (int, float)):
+                total_tools += int(tools_data)
+
     # Clamp page
     if page > total_pages:
         page = total_pages
@@ -2313,8 +3047,11 @@ async def render_mcps_list(update_or_query, context, user_id, current_dir, page=
 
     lines = [
         "<b>🛠️ Model Context Protocol (MCP) Servers</b>\n",
-        f"📍 <i>Workspace: {html.escape(os.path.basename(current_dir) or 'Root')}</i>\n"
+        f"📍 <i>Workspace: {html.escape(os.path.basename(current_dir) or 'Root')}</i>\n",
     ]
+
+    if total_tools > 0:
+        lines.append(f"🔧 <b>MCP 工具总数:</b> <code>{total_tools}</code>\n")
 
     if not mcp_config:
         lines.append("📭 <i>No MCP servers configured in this workspace yet.</i>\n")
@@ -2333,9 +3070,9 @@ async def render_mcps_list(update_or_query, context, user_id, current_dir, page=
             mcp_type = info.get("type", "local")
 
             status_icon = "🟢" if is_enabled else "🔴"
-            status_text = "Enabled" if is_enabled else "Disabled"
 
             conn_icon = ""
+            srv_tool_count = 0
             if is_enabled:
                 live_info = connected_servers.get(name, {})
                 status = live_info.get("status")
@@ -2346,13 +3083,21 @@ async def render_mcps_list(update_or_query, context, user_id, current_dir, page=
                 
                 if is_connected:
                     conn_icon = " 🔗 (Connected)"
+                    srv_tools_data = live_info.get("tools", [])
+                    if isinstance(srv_tools_data, list):
+                        srv_tool_count = len(srv_tools_data)
+                    elif isinstance(srv_tools_data, (int, float)):
+                        srv_tool_count = int(srv_tools_data)
                 else:
                     conn_icon = " ⚠️ (Disconnected)"
 
             type_display = "💻 Stdio (Local)" if mcp_type == "local" else "🌐 Remote (SSE)"
 
             lines.append(f"{status_icon} <b>{html.escape(name)}</b> {conn_icon}")
-            lines.append(f"   • Type: <code>{type_display}</code>")
+            type_line = f"   • Type: <code>{type_display}</code>"
+            if srv_tool_count > 0:
+                type_line += f"  • Tools: <code>{srv_tool_count}</code>"
+            lines.append(type_line)
             
             if mcp_type == "local":
                 cmd_list = info.get("command", [])
@@ -2708,3 +3453,200 @@ async def restart_opencode_serve(update_or_query, context, user_id, work_dir) ->
     if success:
         context.bot_data["server_started"] = True
     return success
+
+
+async def restart_opencode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    session_mgr = context.bot_data["session_manager"]
+    config = context.bot_data["config"]
+    base_dir = os.path.abspath(config.opencode_work_dir)
+    current_dir = os.path.abspath(await session_mgr.get_user_work_dir(user_id, base_dir))
+    folder_name = os.path.basename(current_dir) or current_dir
+
+    status_msg = await update.message.reply_text(
+        "🔄 <b>Restarting OpenCode server...</b>\n"
+        f"📍 <i>Workspace: {html.escape(folder_name)}</i>",
+        parse_mode="HTML",
+    )
+
+    success = await restart_opencode_serve(update, context, user_id, current_dir)
+    if success:
+        await status_msg.edit_text(
+            "✅ <b>OpenCode server restarted.</b>\n\n"
+            f"📍 <i>Workspace: {html.escape(folder_name)}</i>\n"
+            f"<code>{html.escape(current_dir)}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    context.bot_data["server_started"] = False
+    await status_msg.edit_text(
+        "❌ <b>Failed to restart OpenCode server.</b>\n\n"
+        f"📍 <i>Workspace: {html.escape(folder_name)}</i>\n"
+        f"<code>{html.escape(current_dir)}</code>\n\n"
+        "The port may already be in use by an unmanaged server, or OpenCode failed to start. "
+        "Check bot logs and <code>/ps</code>.",
+        parse_mode="HTML",
+    )
+
+
+async def ps_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List opencode/LSP processes and identify orphans for cleanup."""
+    import subprocess as sp
+    import re
+
+    try:
+        result = sp.run(
+            ["ps", "-eo", "pid,ppid,etime,command"],
+            capture_output=True, text=True, timeout=5,
+        )
+        all_lines = result.stdout.strip().split("\n")
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Failed to list processes: {html.escape(str(e))}",
+            parse_mode="HTML",
+        )
+        return
+
+    def is_opencode_serve(cmd: str) -> bool:
+        return "opencode" in cmd.lower() and "serve" in cmd.lower()
+
+    def is_lsp_related(cmd: str) -> bool:
+        lsp_keywords = [
+            "language-server", "language_server", "lsp-daemon",
+            "yaml-language-server", "bash-language-server",
+            "typescript-language-server", "pyright", "basedpyright",
+            "gopls", "rust-analyzer", "clangd", "lua-language-server",
+            "oh-my-openagent",
+        ]
+        cmd_lower = cmd.lower()
+        return any(kw in cmd_lower for kw in lsp_keywords)
+
+    procs: list[dict] = []
+    for line in all_lines[1:]:
+        parts = line.strip().split(None, 3)
+        if len(parts) < 4:
+            continue
+        pid, ppid, etime, command = int(parts[0]), int(parts[1]), parts[2], parts[3]
+        if is_opencode_serve(command) or is_lsp_related(command):
+            procs.append({
+                "pid": pid, "ppid": ppid, "etime": etime, "command": command,
+                "is_serve": is_opencode_serve(command),
+                "is_lsp": is_lsp_related(command),
+            })
+
+    if not procs:
+        await update.message.reply_text(
+            "📭 <b>No OpenCode/LSP processes found.</b>\n\nAll clean — no running servers or language servers detected.",
+            parse_mode="HTML",
+        )
+        return
+
+    serve_pids = {p["pid"] for p in procs if p["is_serve"]}
+
+    from opencode.server import _server_process
+    tracked_pid = _server_process.pid if _server_process and _server_process.poll() is None else None
+
+    orphans: list[dict] = []
+    active: list[dict] = []
+
+    for p in procs:
+        if p["is_serve"]:
+            if p["pid"] == tracked_pid:
+                active.append({**p, "status": "tracked", "label": "🔹 Active (bot-tracked)"})
+            else:
+                active.append({**p, "status": "wild", "label": "⚠️ Wild (not tracked by bot)"})
+        else:
+            parent_pid = p["ppid"]
+            parent_cmd = ""
+            parent_is_serve = False
+            for pp in procs:
+                if pp["pid"] == parent_pid:
+                    parent_cmd = pp["command"]
+                    parent_is_serve = pp["is_serve"]
+                    break
+
+            parent_alive = False
+            try:
+                os.kill(parent_pid, 0)
+                parent_alive = True
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+            if parent_alive and parent_is_serve:
+                active.append({**p, "status": "child", "label": f"  📎 Child of serve (pid {parent_pid})"})
+            elif parent_alive and not parent_is_serve:
+                # Walk up the tree to find a serve ancestor (handles pnpm wrapper chains)
+                ancestor_is_serve = False
+                check_pid = parent_pid
+                for _ in range(5):
+                    for pp in procs:
+                        if pp["pid"] == check_pid:
+                            if pp["is_serve"]:
+                                ancestor_is_serve = True
+                            check_pid = pp["ppid"]
+                            break
+                    else:
+                        break
+                    if ancestor_is_serve:
+                        break
+
+                if ancestor_is_serve:
+                    active.append({**p, "status": "child", "label": f"  📎 Sub-child of serve tree"})
+                elif "Visual Studio Code" in parent_cmd or "Code Helper" in parent_cmd:
+                    continue  # VSCode manages its own LSP servers
+                else:
+                    orphans.append({**p, "status": "orphan", "label": f"  🔗 Non-serve parent (pid {parent_pid})"})
+            else:
+                orphans.append({**p, "status": "orphan", "label": f"  💀 Orphan (parent pid {parent_pid} dead)"})
+
+    lines = ["<b>🔍 OpenCode Process Inspector</b>\n"]
+
+    if active:
+        lines.append("<b>✅ Active Processes</b>")
+        for p in active:
+            cmd_short = p["command"][:80] + "…" if len(p["command"]) > 80 else p["command"]
+            lines.append(f"{p['label']}")
+            lines.append(f"  <code>PID {p['pid']}</code> · up {p['etime']} · <code>{html.escape(cmd_short)}</code>")
+            lines.append("")
+
+    if orphans:
+        lines.append(f"<b>💀 Orphan Processes ({len(orphans)})</b>")
+        lines.append("<i>These have no living parent opencode-serve and can be safely killed.</i>\n")
+        for p in orphans:
+            cmd_short = p["command"][:80] + "…" if len(p["command"]) > 80 else p["command"]
+            lines.append(f"{p['label']}")
+            lines.append(f"  <code>PID {p['pid']}</code> · up {p['etime']} · <code>{html.escape(cmd_short)}</code>")
+            lines.append("")
+    else:
+        lines.append("<b>✨ No orphan processes found!</b>")
+
+    keyboard = []
+    if orphans:
+        orphan_pids = [str(p["pid"]) for p in orphans]
+        keyboard.append([InlineKeyboardButton(
+            f"🗑️ Kill All {len(orphans)} Orphan(s)",
+            callback_data=f"ps_kill:{','.join(orphan_pids)}",
+        )])
+        for p in orphans:
+            keyboard.append([InlineKeyboardButton(
+                f"❌ Kill PID {p['pid']}",
+                callback_data=f"ps_kill:{p['pid']}",
+            )])
+
+    wild_serves = [p for p in active if p.get("status") == "wild"]
+    if wild_serves:
+        wild_pids = [str(p["pid"]) for p in wild_serves]
+        keyboard.append([InlineKeyboardButton(
+            f"⚠️ Kill {len(wild_serves)} Untracked opencode-serve",
+            callback_data=f"ps_kill:{','.join(wild_pids)}",
+        )])
+
+    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+
+    from utils.formatting import split_message
+    output = "\n".join(lines)
+    chunks = split_message(output, 4000)
+    for i, chunk in enumerate(chunks):
+        markup = reply_markup if i == len(chunks) - 1 else None
+        await update.message.reply_text(chunk, reply_markup=markup, parse_mode="HTML")

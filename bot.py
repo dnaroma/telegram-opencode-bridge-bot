@@ -18,6 +18,10 @@ import asyncio
 import logging
 import sys
 import os
+import time
+import subprocess
+import secrets
+from urllib.parse import urlparse
 
 # Switch to Selector Event Loop on Windows for robust signal handling and clean shutdowns
 if sys.platform == 'win32':
@@ -49,6 +53,8 @@ from handlers.commands import (
     plan_command,
     build_command,
     mode_command,
+    subagents_command,
+    restart_opencode_command,
     share_command,
     status_command,
     id_command,
@@ -64,6 +70,7 @@ from handlers.commands import (
     callback_handler,
     mcps_command,
     skills_command,
+    ps_command,
 )
 from handlers.messages import handle_message, handle_document
 
@@ -76,11 +83,14 @@ logging.basicConfig(
 logger = logging.getLogger("opencode-telegram-bot")
 
 _lock_file = None
+_webhook_path_secret = None
+_telegram_webhook_secret = None
 
 def acquire_bot_lock():
     """Acquire an exclusive lock file to prevent multiple instances from running concurrently."""
     global _lock_file
-    lock_path = os.path.join(os.path.abspath("."), "bot.lock")
+    lock_dir = os.environ.get("BOT_LOCK_DIR", os.path.abspath("."))
+    lock_path = os.path.join(lock_dir, "bot.lock")
     try:
         _lock_file = open(lock_path, "w")
         if os.name == 'nt':
@@ -170,6 +180,14 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         await mode_command(update, context)
 
     @authorized(authorizer, rate_limiter)
+    async def _subagents(update, context):
+        await subagents_command(update, context)
+
+    @authorized(authorizer, rate_limiter)
+    async def _restart_opencode(update, context):
+        await restart_opencode_command(update, context)
+
+    @authorized(authorizer, rate_limiter)
     async def _share(update, context):
         await share_command(update, context)
 
@@ -233,6 +251,10 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
     async def _skills(update, context):
         await skills_command(update, context)
 
+    @authorized(authorizer, rate_limiter)
+    async def _ps(update, context):
+        await ps_command(update, context)
+
     return {
         "start": _start,
         "help": _help,
@@ -250,6 +272,8 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         "plan": _plan,
         "build": _build,
         "mode": _mode,
+        "subagents": _subagents,
+        "restart_opencode": _restart_opencode,
         "share": _share,
         "status": _status,
         "id": _id,
@@ -258,6 +282,7 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         "document": _document,
         "mcps": _mcps,
         "skills": _skills,
+        "ps": _ps,
     }
 
 
@@ -304,6 +329,12 @@ async def post_shutdown(application) -> None:
     """Clean up resources on shutdown."""
     logger.info("Shutting down...")
 
+    try:
+        from opencode.session_delivery import cancel_all_session_deliveries
+        await asyncio.wait_for(cancel_all_session_deliveries(application.bot_data), timeout=3.0)
+    except Exception as e:
+        logger.warning(f"Failed to stop session delivery watchers: {e}")
+
     # Stop the background opencode server process if running
     try:
         from opencode.server import stop_server
@@ -326,6 +357,19 @@ async def post_shutdown(application) -> None:
             await asyncio.wait_for(oc_client.close(), timeout=3.0)
         except Exception as e:
             logger.warning(f"Failed to close HTTP client: {e}")
+
+    _stop_cloudflare_tunnel()
+
+    global _lock_file
+    if _lock_file:
+        try:
+            _lock_file.close()
+            lock_dir = os.environ.get("BOT_LOCK_DIR", os.path.abspath("."))
+            lock_path = os.path.join(lock_dir, "bot.lock")
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
+        except Exception:
+            pass
 
     logger.info("Goodbye!")
 
@@ -444,7 +488,7 @@ OPENCODE_WORK_DIR="{work_dir}"
 
 # Limits
 MAX_MESSAGE_LENGTH=4000
-RESPONSE_TIMEOUT=0  # Set to 0 to disable request timeouts entirely
+RESPONSE_TIMEOUT=300
 
 # Database
 DB_PATH=sessions.db
@@ -462,8 +506,132 @@ DB_PATH=sessions.db
         print(f"\n❌ Error writing to .env file: {e}")
 
 
+def _build_application():
+    """Construct and return a fully-wired Telegram Application (no side effects)."""
+    authorizer = UserAuthorizer(config.authorized_users)
+    rate_limiter = RateLimiter(max_requests=20, window_seconds=60)
+
+    oc_client = OpenCodeClient(
+        server_url=config.opencode_server_url,
+        username=config.opencode_server_username,
+        password=config.opencode_server_password,
+        timeout=config.response_timeout,
+    )
+
+    session_mgr = SessionManager(db_path=config.db_path)
+
+    request = RetryingHTTPXRequest(
+        connect_timeout=10.0,
+        read_timeout=8.0,
+        write_timeout=15.0,
+        pool_timeout=5.0,
+        connection_pool_size=512,
+    )
+
+    application = (
+        ApplicationBuilder()
+        .token(config.telegram_bot_token)
+        .request(request)
+        .get_updates_request(request)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    application.add_error_handler(error_handler)
+
+    application.bot_data["config"] = config
+    application.bot_data["opencode_client"] = oc_client
+    application.bot_data["session_manager"] = session_mgr
+    application.bot_data["server_started"] = False
+
+    handlers = build_authorized_handlers(authorizer, rate_limiter)
+
+    application.add_handler(CommandHandler("start", handlers["start"], block=False))
+    application.add_handler(CommandHandler("help", handlers["help"], block=False))
+    application.add_handler(CommandHandler("new", handlers["new"], block=False))
+    application.add_handler(CommandHandler("sessions", handlers["sessions"], block=False))
+    application.add_handler(CommandHandler("delete", handlers["delete"], block=False))
+    application.add_handler(CommandHandler("models", handlers["models"], block=False))
+    application.add_handler(CommandHandler("stop", handlers["stop"], block=False))
+    application.add_handler(CommandHandler("project", handlers["project"], block=False))
+    application.add_handler(CommandHandler("create_project", handlers["create_project"], block=False))
+    application.add_handler(CommandHandler("delete_project", handlers["delete_project"], block=False))
+    application.add_handler(CommandHandler("enable", handlers["enable"], block=False))
+    application.add_handler(CommandHandler("disable", handlers["disable"], block=False))
+    application.add_handler(CommandHandler("history", handlers["history"], block=False))
+    application.add_handler(CommandHandler("mode", handlers["mode"], block=False))
+    application.add_handler(CommandHandler("subagents", handlers["subagents"], block=False))
+    application.add_handler(CommandHandler("restart_opencode", handlers["restart_opencode"], block=False))
+    application.add_handler(CommandHandler("plan", handlers["plan"], block=False))
+    application.add_handler(CommandHandler("build", handlers["build"], block=False))
+    application.add_handler(CommandHandler("share", handlers["share"], block=False))
+    application.add_handler(CommandHandler("status", handlers["status"], block=False))
+    application.add_handler(CommandHandler("id", handlers["id"], block=False))
+    application.add_handler(CommandHandler("mcps", handlers["mcps"], block=False))
+    application.add_handler(CommandHandler("skills", handlers["skills"], block=False))
+    application.add_handler(CommandHandler("ps", handlers["ps"], block=False))
+
+    application.add_handler(CallbackQueryHandler(handlers["callback"], block=False))
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handlers["message"],
+            block=False,
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            (filters.Document.ALL | filters.PHOTO) & ~filters.COMMAND,
+            handlers["document"],
+            block=False,
+        )
+    )
+
+    return application
+
+
+_tunnel_process = None
+
+
+def _start_cloudflare_tunnel(token: str) -> bool:
+    global _tunnel_process
+    try:
+        _tunnel_process = subprocess.Popen(
+            ["cloudflared", "tunnel", "run", "--token", token],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        logger.info(f"☁️ Cloudflare Tunnel started (PID {_tunnel_process.pid})")
+        return True
+    except FileNotFoundError:
+        logger.error("❌ cloudflared not found. Install: brew install cloudflared")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Failed to start Cloudflare Tunnel: {e}")
+        return False
+
+
+def _stop_cloudflare_tunnel():
+    global _tunnel_process
+    if _tunnel_process and _tunnel_process.poll() is None:
+        _tunnel_process.terminate()
+        try:
+            _tunnel_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _tunnel_process.kill()
+        logger.info("☁️ Cloudflare Tunnel stopped")
+    _tunnel_process = None
+
+
+MAX_CRASH_RESTARTS = 10
+CRASH_RESTART_COOLDOWN = 30  # seconds — reset crash counter after this long stable
+
+
 def main():
-    """Build and run the Telegram bot."""
+    """Build and run the Telegram bot with automatic crash recovery."""
 
     # If --env CLI flag is passed, or if .env does not exist, run setup
     if "--env" in sys.argv:
@@ -502,102 +670,142 @@ def main():
     logger.info(f"  Default Model:   {config.opencode_model}")
     logger.info(f"  Work Directory:  {config.opencode_work_dir}")
     logger.info(f"  Authorized Users: {len(config.authorized_users)}")
+    logger.info(f"  Mode: {'Webhook' if config.webhook_mode else 'Long Polling'}")
     logger.info("=" * 50)
 
-    # ── Initialize components ─────────────────────────────
-    authorizer = UserAuthorizer(config.authorized_users)
-    rate_limiter = RateLimiter(max_requests=20, window_seconds=60)
+    if config.webhook_mode:
+        _run_webhook_mode()
+    else:
+        _run_polling_mode()
 
-    oc_client = OpenCodeClient(
-        server_url=config.opencode_server_url,
-        username=config.opencode_server_username,
-        password=config.opencode_server_password,
-        timeout=config.response_timeout,
+
+def _run_polling_mode():
+    crash_count = 0
+    last_crash_time = 0.0
+
+    while True:
+        try:
+            application = _build_application()
+            logger.info("Starting bot with long polling...")
+            application.run_polling(
+                drop_pending_updates=True,
+                allowed_updates=["message", "callback_query"],
+            )
+            logger.info("Bot polling stopped cleanly.")
+            break
+
+        except KeyboardInterrupt:
+            logger.info("Received KeyboardInterrupt — shutting down.")
+            break
+
+        except SystemExit:
+            raise
+
+        except Exception as fatal:
+            now = time.time()
+            if (now - last_crash_time) > CRASH_RESTART_COOLDOWN:
+                crash_count = 0
+            crash_count += 1
+            last_crash_time = now
+
+            if crash_count > MAX_CRASH_RESTARTS:
+                logger.critical(
+                    "💥 Bot crashed %d times within %ds — giving up. Last: %s",
+                    crash_count, CRASH_RESTART_COOLDOWN, fatal, exc_info=True,
+                )
+                sys.exit(1)
+
+            backoff = min(5 * crash_count, 60)
+            logger.error("💥 Unhandled crash #%d/%d: %s\nRestarting in %ds…", crash_count, MAX_CRASH_RESTARTS, fatal, backoff, exc_info=True)
+            time.sleep(backoff)
+
+
+def _resolve_webhook_url() -> str | None:
+    """Return the public webhook base URL (must be set via WEBHOOK_URL env var)."""
+    if config.webhook_url:
+        parsed = urlparse(config.webhook_url)
+        if parsed.scheme != "https" or not parsed.netloc or parsed.query or parsed.fragment:
+            logger.error("WEBHOOK_URL must be an HTTPS origin without query or fragment")
+            return None
+        return config.webhook_url.rstrip("/")
+
+    logger.error(
+        "❌ WEBHOOK_URL is required in webhook mode. "
+        "Set it to the public URL of your Cloudflare Tunnel DNS entry, e.g. https://bot.example.com"
     )
+    return None
 
-    session_mgr = SessionManager(db_path=config.db_path)
 
-    # ── Build Telegram application ────────────────────────
-    request = RetryingHTTPXRequest(
-        connect_timeout=15.0,
-        read_timeout=20.0,
-        write_timeout=20.0,
-        pool_timeout=5.0,
-        connection_pool_size=512,
-    )
+def _run_webhook_mode():
+    # Start Cloudflare Tunnel if a token is configured (optional — user may run tunnel separately)
+    if config.cloudflare_tunnel_token:
+        if not _start_cloudflare_tunnel(config.cloudflare_tunnel_token):
+            logger.warning("⚠️ Failed to start Cloudflare Tunnel. Continuing (assume tunnel is already running).")
 
-    application = (
-        ApplicationBuilder()
-        .token(config.telegram_bot_token)
-        .request(request)
-        .get_updates_request(request)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
+    webhook_base = _resolve_webhook_url()
+    if not webhook_base:
+        logger.error("❌ Cannot resolve webhook URL. Falling back to polling.")
+        _stop_cloudflare_tunnel()
+        _run_polling_mode()
+        return
 
-    # ── Register global error handler ─────────────────────
-    application.add_error_handler(error_handler)
+    # Never put credentials in the URL.  A configured path is stable across
+    # crash-loop rebuilds; the fallback is generated once per process.
+    global _webhook_path_secret, _telegram_webhook_secret
+    if not _webhook_path_secret:
+        _webhook_path_secret = config.webhook_path_secret or secrets.token_urlsafe(32)
+    if not _telegram_webhook_secret:
+        _telegram_webhook_secret = config.telegram_webhook_secret or secrets.token_urlsafe(32)
+    telegram_secret = _telegram_webhook_secret
+    webhook_path = f"/bot/{_webhook_path_secret}"
+    full_webhook_url = f"{webhook_base}{webhook_path}"
 
-    # Store components in bot_data for access in handlers
-    application.bot_data["config"] = config
-    application.bot_data["opencode_client"] = oc_client
-    application.bot_data["session_manager"] = session_mgr
-    application.bot_data["server_started"] = False
+    crash_count = 0
+    last_crash_time = 0.0
 
-    # ── Build auth-wrapped handlers ───────────────────────
-    handlers = build_authorized_handlers(authorizer, rate_limiter)
+    while True:
+        try:
+            application = _build_application()
+            logger.info(f"Starting bot in webhook mode on port {config.webhook_port}…")
+            logger.info("  Webhook URL configured (secret path redacted)")
+            application.run_webhook(
+                listen="0.0.0.0",
+                port=config.webhook_port,
+                url_path=webhook_path,
+                webhook_url=full_webhook_url,
+                secret_token=telegram_secret,
+                allowed_updates=["message", "callback_query"],
+                drop_pending_updates=True,
+            )
+            logger.info("Bot webhook stopped cleanly.")
+            break
 
-    # ── Register command handlers ─────────────────────────
-    application.add_handler(CommandHandler("start", handlers["start"], block=False))
-    application.add_handler(CommandHandler("help", handlers["help"], block=False))
-    application.add_handler(CommandHandler("new", handlers["new"], block=False))
-    application.add_handler(CommandHandler("sessions", handlers["sessions"], block=False))
-    application.add_handler(CommandHandler("delete", handlers["delete"], block=False))
-    application.add_handler(CommandHandler("models", handlers["models"], block=False))
-    application.add_handler(CommandHandler("stop", handlers["stop"], block=False))
-    application.add_handler(CommandHandler("project", handlers["project"], block=False))
-    application.add_handler(CommandHandler("create_project", handlers["create_project"], block=False))
-    application.add_handler(CommandHandler("delete_project", handlers["delete_project"], block=False))
-    application.add_handler(CommandHandler("enable", handlers["enable"], block=False))
-    application.add_handler(CommandHandler("disable", handlers["disable"], block=False))
-    application.add_handler(CommandHandler("history", handlers["history"], block=False))
-    application.add_handler(CommandHandler("mode", handlers["mode"], block=False))
-    application.add_handler(CommandHandler("plan", handlers["plan"], block=False))
-    application.add_handler(CommandHandler("build", handlers["build"], block=False))
-    application.add_handler(CommandHandler("share", handlers["share"], block=False))
-    application.add_handler(CommandHandler("status", handlers["status"], block=False))
-    application.add_handler(CommandHandler("id", handlers["id"], block=False))
-    application.add_handler(CommandHandler("mcps", handlers["mcps"], block=False))
-    application.add_handler(CommandHandler("skills", handlers["skills"], block=False))
+        except KeyboardInterrupt:
+            logger.info("Received KeyboardInterrupt — shutting down.")
+            break
 
-    # ── Register callback query handler ───────────────────
-    application.add_handler(CallbackQueryHandler(handlers["callback"], block=False))
+        except SystemExit:
+            raise
 
-    # ── Register message handler (catches all text) ───────
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handlers["message"],
-            block=False,
-        )
-    )
+        except Exception as fatal:
+            now = time.time()
+            if (now - last_crash_time) > CRASH_RESTART_COOLDOWN:
+                crash_count = 0
+            crash_count += 1
+            last_crash_time = now
 
-    # ── Register document handler (catches file uploads) ──
-    application.add_handler(
-        MessageHandler(
-            (filters.Document.ALL | filters.PHOTO) & ~filters.COMMAND,
-            handlers["document"],
-            block=False,
-        )
-    )
+            if crash_count > MAX_CRASH_RESTARTS:
+                logger.critical(
+                    "💥 Bot crashed %d times within %ds — giving up. Last: %s",
+                    crash_count, CRASH_RESTART_COOLDOWN, fatal, exc_info=True,
+                )
+                sys.exit(1)
 
-    # ── Start polling ─────────────────────────────────────
-    logger.info("Starting bot with long polling...")
-    application.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=["message", "callback_query"],
-    )
+            backoff = min(5 * crash_count, 60)
+            logger.error("💥 Unhandled crash #%d/%d: %s\nRestarting in %ds…", crash_count, MAX_CRASH_RESTARTS, fatal, backoff, exc_info=True)
+            time.sleep(backoff)
+
+    _stop_cloudflare_tunnel()
 
 
 if __name__ == "__main__":
