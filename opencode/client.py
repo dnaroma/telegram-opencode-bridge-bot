@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import aiohttp
 
@@ -58,6 +58,17 @@ class OpenCodeMessage:
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     error_name: str = ""
     error_message: str = ""
+
+
+SessionStatus = Literal["busy", "retry", "idle"]
+
+
+@dataclass(frozen=True, slots=True)
+class SessionStatusMapResult:
+    """Normalized status-map lookup with explicit endpoint availability."""
+
+    available: bool
+    statuses: Dict[str, SessionStatus]
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +504,26 @@ class OpenCodeClient:
                     return value
         return []
 
+    async def get_session_status_map(self) -> SessionStatusMapResult:
+        """Return normalized session statuses and endpoint availability."""
+        try:
+            result = await self._request("GET", "/session/status")
+        except OpenCodeError as exc:
+            logger.warning("OpenCode session-status endpoint is unavailable: %s", exc)
+            return SessionStatusMapResult(available=False, statuses={})
+
+        status_map: Dict[str, Any] = {}
+        if isinstance(result, dict):
+            wrapped = result.get("statuses", result.get("data"))
+            status_map = wrapped if isinstance(wrapped, dict) else result
+
+        statuses: Dict[str, SessionStatus] = {}
+        for session_id, value in status_map.items():
+            status = value.get("type") if isinstance(value, dict) else value
+            if status in ("busy", "retry", "idle"):
+                statuses[session_id] = status
+        return SessionStatusMapResult(available=True, statuses=statuses)
+
     async def abort_session(self, session_id: str) -> bool:
         """Send an abort signal to stop active model processing in a session."""
         try:
@@ -521,18 +552,15 @@ class OpenCodeClient:
         Parameters:
             session_id: The session identifier.
             permission_id: The permission request identifier.
-            response: "once" | "always" | "reject" (or legacy "allow" | "deny").
+            response: "once" | "always" | "reject".
             remember: Whether to remember this decision for future operations in this session.
 
         Returns:
             True if the server successfully recorded the response, False otherwise.
         """
-        # Map legacy/semantic allow/deny values to OpenCode's strict once/always/reject contract
         normalized = response.lower().strip()
-        if normalized == "allow":
-            normalized = "once"
-        elif normalized == "deny":
-            normalized = "reject"
+        if normalized not in ("once", "always", "reject"):
+            raise ValueError(f"Unsupported permission response: {response}")
 
         payload = {
             "reply": normalized,
@@ -543,7 +571,7 @@ class OpenCodeClient:
         try:
             result = await self._request(
                 "POST",
-                f"/api/session/{session_id}/permission/{permission_id}/reply",
+                f"/permission/{permission_id}/reply",
                 json_data=payload,
             )
             if isinstance(result, dict):

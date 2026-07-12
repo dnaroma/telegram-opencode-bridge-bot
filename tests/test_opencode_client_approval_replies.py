@@ -14,14 +14,14 @@ class OpenCodeClientApprovalReplyTests(unittest.IsolatedAsyncioTestCase):
         result = await client.respond_to_permission(
             session_id="ses_abc",
             permission_id="perm_123",
-            response="allow",
+            response="once",
         )
 
         # Then: the current OpenCode reply route and payload are used.
         self.assertTrue(result)
         client._request.assert_awaited_once_with(
             "POST",
-            "/api/session/ses_abc/permission/perm_123/reply",
+            "/permission/perm_123/reply",
             json_data={"reply": "once"},
         )
         await client.close()

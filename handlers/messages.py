@@ -18,6 +18,7 @@ from telegram.constants import ChatAction
 from utils.formatting import format_opencode_response, split_message, format_error, format_tool_output, IMPORTANT_TOOLS
 from utils.security import sanitize_input
 from config import normalize_response_timeout
+from handlers.task_progress import parse_task_progress, upsert_task_progress_card
 from opencode.client import OpenCodeAPIError, OpenCodeConnectionError
 
 logger = logging.getLogger(__name__)
@@ -634,6 +635,12 @@ async def _listen_and_stream_events(
     url = f"{server_url.rstrip('/')}/global/event"
     notified_calls = set()
     completed_calls = set()
+    notified_permissions = set()
+    watched_session_ids = {session_id}
+    # OpenCode can emit an initial pending tool part before the part contains
+    # its `tool` field. Keep the name from the newer tool lifecycle events so
+    # that early progress updates do not regress to a user-visible "unknown".
+    tool_names_by_call_id = {}
     last_update_time = [0.0]
     last_status_text = ["🧠 <b>Thinking...</b>\n<i>Analyzing request and preparing a plan...</i>"]
 
@@ -656,6 +663,29 @@ async def _listen_and_stream_events(
             except Exception as e:
                 logger.debug(f"Failed to update status message: {e}")
 
+    async def refresh_watched_child_sessions():
+        """Discover child sessions before their first permission event arrives."""
+        try:
+            oc_client = context.bot_data.get("opencode_client")
+            list_children = getattr(oc_client, "list_session_children", None)
+            if not callable(list_children):
+                return
+            children = await list_children(session_id)
+            if not isinstance(children, list):
+                return
+            for child in children:
+                if not isinstance(child, dict):
+                    continue
+                child_id = (
+                    child.get("id")
+                    or child.get("sessionID")
+                    or child.get("sessionId")
+                )
+                if isinstance(child_id, str) and child_id:
+                    watched_session_ids.add(child_id)
+        except Exception as exc:
+            logger.debug("Unable to discover child sessions for permission routing: %s", exc)
+
     retry_delay = 1.0
     while True:
         try:
@@ -666,6 +696,7 @@ async def _listen_and_stream_events(
                 async with sse_session.get(url, headers={"Accept": "text/event-stream"}) as resp:
                     # Connection successful, reset retry delay
                     retry_delay = 1.0
+                    await refresh_watched_child_sessions()
                     
                     async for line in resp.content:
                         line_str = line.decode('utf-8').strip()
@@ -708,10 +739,26 @@ async def _listen_and_stream_events(
                             if event_type in ("question.asked", "permission.asked", "permission.updated", "message.part.updated", "message.updated"):
                                 logger.info(f"SSE event: type={event_type} session={event_session_id[:12] if event_session_id else 'NONE'} expected={session_id[:12]} props_keys={list(properties.keys())[:8]}")
 
-                            if event_session_id and event_session_id != session_id:
+                            if event_session_id and event_session_id not in watched_session_ids:
                                 continue
 
                             event_type = payload.get("type", "")
+
+                            # The session.next tool events carry the name before
+                            # the corresponding message part is fully populated.
+                            if event_type == "session.next.tool.input.started":
+                                call_id = properties.get("callID", "")
+                                tool_name = properties.get("name", "")
+                                if call_id and tool_name:
+                                    tool_names_by_call_id[call_id] = str(tool_name)
+                                continue
+
+                            if event_type == "session.next.tool.called":
+                                call_id = properties.get("callID", "")
+                                tool_name = properties.get("tool", "")
+                                if call_id and tool_name:
+                                    tool_names_by_call_id[call_id] = str(tool_name)
+                                continue
 
                             # A. Handle Intermediate Assistant Message Completion (Real-time Streaming)
                             if event_type == "message.updated":
@@ -829,13 +876,21 @@ async def _listen_and_stream_events(
                                     logger.warning("Received permission.asked event but no permission ID was found.")
                                     continue
 
+                                # OpenCode may emit both permission.asked and
+                                # permission.updated for one request. Only send
+                                # one Telegram prompt for a permission ID.
+                                if perm_id in notified_permissions:
+                                    continue
+                                notified_permissions.add(perm_id)
+
                                 # Register pending permission in-memory lookup to avoid Telegram 64-char callback limit
                                 if "pending_permissions" not in context.bot_data:
                                     context.bot_data["pending_permissions"] = {}
 
                                 short_key = uuid.uuid4().hex[:8]
+                                permission_session_id = event_session_id or session_id
                                 context.bot_data["pending_permissions"][short_key] = {
-                                    "session_id": session_id,
+                                    "session_id": permission_session_id,
                                     "permission_id": perm_id
                                 }
 
@@ -859,11 +914,13 @@ async def _listen_and_stream_events(
                                     f"{patterns_text}\n\n"
                                     f"Do you want to allow this operation?"
                                 )
+                                context.bot_data["pending_permissions"][short_key]["prompt_text"] = msg
 
                                 keyboard = [
                                     [
-                                        InlineKeyboardButton("✅ Yes, Allow", callback_data=f"perm:allow:{short_key}"),
-                                        InlineKeyboardButton("❌ No, Deny", callback_data=f"perm:deny:{short_key}")
+                                        InlineKeyboardButton("✅ Allow once", callback_data=f"perm:once:{short_key}"),
+                                        InlineKeyboardButton("♾️ Allow always", callback_data=f"perm:always:{short_key}"),
+                                        InlineKeyboardButton("❌ Reject", callback_data=f"perm:reject:{short_key}")
                                     ]
                                 ]
 
@@ -976,8 +1033,14 @@ async def _listen_and_stream_events(
                                 
                                 part_type = part.get("type", "")
                                 if part_type == "tool":
-                                    tool_name = part.get("tool", "unknown")
-                                    call_id = part.get("callID", "unknown")
+                                    call_id = part.get("callID", "")
+                                    part_tool_name = part.get("tool", "")
+                                    if call_id and part_tool_name:
+                                        tool_names_by_call_id[call_id] = str(part_tool_name)
+                                    tool_name = str(
+                                        part_tool_name
+                                        or tool_names_by_call_id.get(call_id, "")
+                                    )
                                     state = part.get("state", {})
                                     if not isinstance(state, dict):
                                         continue
@@ -989,10 +1052,34 @@ async def _listen_and_stream_events(
                                     if not isinstance(metadata, dict):
                                         metadata = {}
 
+                                    # A task tool creates a child session. Add it
+                                    # immediately so its permission events are
+                                    # accepted even before /children is refreshed.
+                                    if tool_name == "task":
+                                        child_session_id = (
+                                            metadata.get("sessionId")
+                                            or metadata.get("sessionID")
+                                        )
+                                        if isinstance(child_session_id, str) and child_session_id:
+                                            watched_session_ids.add(child_session_id)
+
+                                    if tool_name == "task" and not is_streaming:
+                                        task_event = parse_task_progress(part, session_id)
+                                        if task_event is not None:
+                                            await upsert_task_progress_card(
+                                                update.message,
+                                                context,
+                                                task_event,
+                                                reply_to_message_id,
+                                            )
+
                                     # ── 1. Update In-Place Status Message (Always Active) ──
                                     if status in ("pending", "running") and status_msg_holder and status_msg_holder[0]:
                                         if status == "pending" and not (isinstance(input_data, dict) and input_data):
-                                            status_text = f"⚙️ <b>Preparing tool <code>{html.escape(tool_name)}</code>...</b>"
+                                            if tool_name:
+                                                status_text = f"⚙️ <b>Preparing tool <code>{html.escape(tool_name)}</code>...</b>"
+                                            else:
+                                                status_text = "⚙️ <b>Preparing tool...</b>"
                                         else:
                                             status_text = ""
                                             if tool_name == "bash":

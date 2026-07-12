@@ -704,6 +704,8 @@ async def subagents_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     oc_client = bot_data.get("opencode_client")
     child_sessions = []
     listing_unavailable = False
+    status_map_available = False
+    session_statuses = {}
     try:
         child_sessions = await oc_client.list_session_children(session_id)
         listing_unavailable = not getattr(oc_client, "child_session_listing_available", True)
@@ -712,6 +714,15 @@ async def subagents_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     except Exception as exc:
         listing_unavailable = True
         logger.warning("Failed to list child sessions for %s: %s", session_id, exc)
+
+    try:
+        status_result = await oc_client.get_session_status_map()
+        status_map_available = status_result.available
+        session_statuses = status_result.statuses
+    except AttributeError:
+        status_map_available = False
+    except Exception as exc:
+        logger.warning("Failed to retrieve session statuses: %s", exc)
 
     observer_state = None
     for state in bot_data.get("session_delivery_states", {}).values():
@@ -744,10 +755,11 @@ async def subagents_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             if not isinstance(child, dict):
                 continue
             child_id = str(child.get("id", ""))
+            if not child_id:
+                continue
             title = str(child.get("title") or child.get("name") or child_id[:12])
-            agent = str(child.get("agent") or child.get("agentID") or child.get("mode") or "unknown")
-            raw_status = child.get("status", "unknown")
-            status = raw_status.get("type", "unknown") if isinstance(raw_status, dict) else str(raw_status)
+            agent = str(child.get("agent") or child.get("agentID") or child.get("mode") or "unspecified")
+            status = session_statuses.get(child_id, "idle") if status_map_available else "unavailable"
             lines.append(f"• <code>{html.escape(child_id[:12])}</code> {html.escape(title)}")
             lines.append(f"  Agent: <code>{html.escape(agent)}</code> | Status: <code>{html.escape(status)}</code>")
 
@@ -2104,7 +2116,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith("perm:"):
         parts = data.split(":")
         if len(parts) == 3:
-            action = parts[1]      # "allow" or "deny"
+            action = parts[1]      # "once", "always", or "reject"
             short_key = parts[2]   # 8-char lookup key
             
             pending_perms = bot_data.get("pending_permissions", {})
@@ -2120,7 +2132,45 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             session_id = pending["session_id"]
             permission_id = pending["permission_id"]
             
-            response_value = "once" if action == "allow" else "reject"
+            # Keep accepting callbacks from older prompts after a bot restart.
+            if action not in ("once", "always", "reject", "always_confirm", "always_cancel"):
+                await query.edit_message_text(
+                    text=f"{query.message.text}\n\n⚠️ <b>Invalid permission action.</b>",
+                    parse_mode="HTML",
+                )
+                return
+
+            if action == "always":
+                confirm_keyboard = [[
+                    InlineKeyboardButton("✅ Confirm always", callback_data=f"perm:always_confirm:{short_key}"),
+                    InlineKeyboardButton("↩️ Cancel", callback_data=f"perm:always_cancel:{short_key}"),
+                ]]
+                await query.edit_message_text(
+                    text=(
+                        f"{query.message.text}\n\n"
+                        "⚠️ <b>Confirm permanent permission</b>\n"
+                        "This will allow future matching operations in this OpenCode session without asking again."
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(confirm_keyboard),
+                )
+                return
+
+            if action == "always_cancel":
+                prompt_text = pending.get("prompt_text", query.message.text)
+                prompt_keyboard = [[
+                    InlineKeyboardButton("✅ Allow once", callback_data=f"perm:once:{short_key}"),
+                    InlineKeyboardButton("♾️ Allow always", callback_data=f"perm:always:{short_key}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"perm:reject:{short_key}"),
+                ]]
+                await query.edit_message_text(
+                    text=prompt_text,
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(prompt_keyboard),
+                )
+                return
+
+            response_value = "always" if action == "always_confirm" else action
             
             try:
                 # Call our client's respond_to_permission method
@@ -2136,7 +2186,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 
                 # Format final notification status
                 if response_value == "once":
-                    status_text = "✅ <b>Approved:</b> The agent was allowed to perform this operation."
+                    status_text = "✅ <b>Allowed once:</b> The agent was allowed to perform this operation."
+                elif response_value == "always":
+                    status_text = "♾️ <b>Always allowed:</b> Future matching operations will be allowed."
                 else:
                     status_text = "❌ <b>Rejected:</b> The agent was denied permission to perform this operation."
                 
